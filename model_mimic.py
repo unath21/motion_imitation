@@ -146,7 +146,6 @@ class MAE_ViT(torch.nn.Module):
 class SimpleEncoder(torch.nn.Module):
     def __init__(self, image_size=32, patch_size=2, emb_dim=192, num_layer=12, num_head=3):
         super().__init__()
-        self.cls_token = torch.nn.Parameter(torch.zeros(1, 1, emb_dim))
         self.pos_embedding = torch.nn.Parameter(torch.zeros((image_size // patch_size) ** 2, 1, emb_dim))
         self.patchify = torch.nn.Conv2d(3, emb_dim, patch_size, patch_size)
         self.transformer = torch.nn.Sequential(*[Block(emb_dim, num_head) for _ in range(num_layer)])
@@ -154,72 +153,102 @@ class SimpleEncoder(torch.nn.Module):
         self.init_weight()
 
     def init_weight(self):
-        trunc_normal_(self.cls_token, std=.02)
         trunc_normal_(self.pos_embedding, std=.02)
 
     def forward(self, img): # [512, 3, 32, 32]
         patches = self.patchify(img) # [512, 192, 16, 16]
         patches = rearrange(patches, 'b c h w -> (h w) b c') # [256, 512, 192]
         patches = patches + self.pos_embedding
-        patches = torch.cat([self.cls_token.expand(-1, patches.shape[1], -1), patches], dim=0) # [257, 512, 192]
-        patches = rearrange(patches, 't b c -> b t c') # [512, 257, 192]
+        patches = rearrange(patches, 't b c -> b t c') # [512, 256, 192]
         features = self.layer_norm(self.transformer(patches))
-        features = rearrange(features, 'b t c -> t b c') # [257, 512, 192]
+        features = rearrange(features, 'b t c -> t b c') # [256, 512, 192]
         return features
     
 class SimpleDecoder(torch.nn.Module):
-    def __init__(self, image_size=32, patch_size=2, emb_dim=192, num_layer=4, num_head=3):
+    def __init__(self, image_size=32, patch_size=2, emb_dim=192, num_layer=4, num_head=3, latent_dim=64):
         super().__init__()
         self.pos_embedding = torch.nn.Parameter(torch.zeros((image_size // patch_size) ** 2 + 1, 1, emb_dim))
         self.transformer = torch.nn.Sequential(*[Block(emb_dim, num_head) for _ in range(num_layer)])
         self.head = torch.nn.Linear(emb_dim, 3 * patch_size ** 2)
         self.patch2img = Rearrange('(h w) b (c p1 p2) -> b c (h p1) (w p2)', p1=patch_size, p2=patch_size, h=image_size//patch_size)
+        
+        self.essence_projection = torch.nn.Linear(latent_dim, emb_dim)
+        
         self.init_weight()
 
     def init_weight(self):
         trunc_normal_(self.pos_embedding, std=.02)
+        trunc_normal_(self.essence_projection.weight, std=.02)
+        if self.essence_projection.bias is not None:
+            torch.nn.init.constant_(self.essence_projection.bias, 0)
 
-    def forward(self, features):
+    def forward(self, z, features):
+        # z: (batch, latent_dim) - essence vector
+        z_token = self.essence_projection(z)  # (batch, emb_dim)
+        z_token = rearrange(z_token, 'b c -> 1 b c')  # (1, batch, emb_dim)
+        
+        # Concatenate essence token with features
+        features = torch.cat([z_token, features], dim=0)  # (num_patches + 1, batch, emb_dim)
+        
+        # Add positional embedding
         features = features + self.pos_embedding
+        
         features = rearrange(features, 't b c -> b t c')
         features = self.transformer(features)
         features = rearrange(features, 'b t c -> t b c')
-        features = features[1:] # remove global feature
+        features = features[1:]  # (num_patches, batch, emb_dim)
+        
+        # Generate patches
         patches = self.head(features)
         img = self.patch2img(patches)
         return img
+
+class SimpleEssenceExtractor(torch.nn.Module):
+    def __init__(self, emb_dim=192, latent_dim=64):
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.latent_dim = latent_dim
+        
+        # Global average pooling followed by projection
+        self.global_pool = torch.nn.AdaptiveAvgPool1d(1)
+        self.projection = torch.nn.Sequential(
+            torch.nn.Linear(emb_dim, emb_dim // 2),
+            torch.nn.ReLU(),
+            torch.nn.Linear(emb_dim // 2, latent_dim),
+        )
+        
+        # Initialize weights
+        self.init_weight()
+    
+    def init_weight(self):
+        for m in self.projection:
+            if isinstance(m, torch.nn.Linear):
+                trunc_normal_(m.weight, std=.02)
+                if m.bias is not None:
+                    torch.nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # x: (num_patches, batch, emb_dim)
+        x = rearrange(x, 't b c -> b c t')  # (batch, emb_dim, num_patches)
+        x = self.global_pool(x)  # (batch, emb_dim, 1)
+        x = x.squeeze(-1)  # (batch, emb_dim)
+        essence = self.projection(x)  # (batch, latent_dim)
+        return essence
     
 class SimpleViT(torch.nn.Module):
-    def __init__(self, image_size=32, patch_size=2, emb_dim=192, encoder_layer=12, encoder_head=3, decoder_layer=4, decoder_head=3):
+    def __init__(self, image_size=32, patch_size=2, emb_dim=192, encoder_layer=12, encoder_head=3, decoder_layer=4, decoder_head=3, latent_dim=64):
         super().__init__()
         self.encoder = SimpleEncoder(image_size, patch_size, emb_dim, encoder_layer, encoder_head)
-        self.decoder = SimpleDecoder(image_size, patch_size, emb_dim, decoder_layer, decoder_head)
+        self.essence_extractor = SimpleEssenceExtractor(emb_dim, latent_dim)
+        self.decoder = SimpleDecoder(image_size, patch_size, emb_dim, decoder_layer, decoder_head, latent_dim)
 
-    def forward(self, img):
-        features = self.encoder(img)
-        reconstructed_img = self.decoder(features)
-        return reconstructed_img
-
-class ViT_Classifier(torch.nn.Module):
-    def __init__(self, encoder : MAE_Encoder, num_classes=10) -> None:
-        super().__init__()
-        self.cls_token = encoder.cls_token
-        self.pos_embedding = encoder.pos_embedding
-        self.patchify = encoder.patchify
-        self.transformer = encoder.transformer
-        self.layer_norm = encoder.layer_norm
-        self.head = torch.nn.Linear(self.pos_embedding.shape[-1], num_classes)
-
-    def forward(self, img):
-        patches = self.patchify(img)
-        patches = rearrange(patches, 'b c h w -> (h w) b c')
-        patches = patches + self.pos_embedding
-        patches = torch.cat([self.cls_token.expand(-1, patches.shape[1], -1), patches], dim=0)
-        patches = rearrange(patches, 't b c -> b t c')
-        features = self.layer_norm(self.transformer(patches))
-        features = rearrange(features, 'b t c -> t b c')
-        logits = self.head(features[0])
-        return logits
+    def forward(self, img1, img2):
+        x1 = self.encoder(img1)  # (num_patches, batch, emb_dim)
+        x2 = self.encoder(img2)  # (num_patches, batch, emb_dim)
+        z = self.essence_extractor(x2 - x1)  # (batch, latent_dim)
+        img2_pred = self.decoder(z, x1)  # (batch, 3, height, width)
+        
+        return img2_pred 
 
 
 if __name__ == '__main__':
