@@ -12,6 +12,7 @@ from einops import rearrange
 import torch.nn.functional as F
 
 from model_mimic import SimpleViT
+from model_dcae import DCAE, dc_ae_f32c32, dc_ae_f64c128, dc_ae_f128c512
 from utils import setup_seed
 from simple_pair_dataset import SimplePairDataset
 
@@ -167,11 +168,22 @@ if __name__ == '__main__':
         writer = None
 
     # Create model with config parameters
-    model = SimpleViT(
-        image_size=config['model']['image_size'],
-        patch_size=config['model']['patch_size'],
-        latent_dim=config['model']['latent_dim']
-    )
+    if config['model']['type'] == 'SimpleViT':
+        model = SimpleViT(
+            image_size=config['model']['image_size'],
+            patch_size=config['model']['patch_size'],
+            latent_dim=config['model']['latent_dim']
+        )
+    elif config['model']['type'] == 'DCAE':
+        if config['model']['dcae_latent_dim'] == 32:
+            cfg = dc_ae_f32c32(name='dc-ae-f32c32-in-1.0', pretrained_path=None)
+        elif config['model']['dcae_latent_dim'] == 64:
+            cfg = dc_ae_f64c128(name='dc-ae-f64c128-in-1.0', pretrained_path=None)
+        elif config['model']['dcae_latent_dim'] == 128:
+            cfg = dc_ae_f128c512(name='dc-ae-f128c512-in-1.0', pretrained_path=None)
+        model = DCAE(
+            cfg=cfg
+        )
     
     # Adjust learning rate for effective batch size
     base_lr = config['train']['base_learning_rate'] * effective_batch_size / 256
