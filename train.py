@@ -166,12 +166,21 @@ if __name__ == '__main__':
     else:
         writer = None
 
-    # Create model with config parameters
-    model = SimpleViT(
-        image_size=config['model']['image_size'],
-        patch_size=config['model']['patch_size'],
-        latent_dim=config['model']['latent_dim']
-    )
+    if config['model']['type'] == 'autoencoder':
+        from model_auto import Autoencoder
+        model = Autoencoder(
+            in_channels=3,
+            out_channels=3,
+            z_channels=4,
+            sample_size=config['model']['image_size'],
+            essence_dim=64
+        )
+    elif config['model']['type'] == 'simplevit':
+        model = SimpleViT(
+            image_size=config['model']['image_size'],
+            patch_size=config['model']['patch_size'],
+            latent_dim=config['model']['latent_dim']
+        )
     
     # Adjust learning rate for effective batch size
     base_lr = config['train']['base_learning_rate'] * effective_batch_size / 256
