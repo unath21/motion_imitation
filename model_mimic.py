@@ -164,6 +164,41 @@ class SimpleEncoder(torch.nn.Module):
         features = rearrange(features, 'b t c -> t b c') # [256, 512, 192]
         return features
     
+class SimpleEncoderDecoder(torch.nn.Module):
+    def __init__(self, image_size=32, patch_size=2, emb_dim=192, num_layer=12, num_head=3, latent_dim=64):
+        super().__init__()
+        self.pos_embedding = torch.nn.Parameter(torch.zeros((image_size // patch_size) ** 2 + 1, 1, emb_dim))
+        self.patchify = torch.nn.Conv2d(3, emb_dim, patch_size, patch_size)
+        self.transformer = torch.nn.Sequential(*[Block(emb_dim, num_head) for _ in range(num_layer)])
+        self.layer_norm = torch.nn.LayerNorm(emb_dim)
+        self.essence_projection = torch.nn.Linear(latent_dim, emb_dim)
+        self.head = torch.nn.Linear(emb_dim, 3 * patch_size ** 2)
+        self.patch2img = Rearrange('(h w) b (c p1 p2) -> b c (h p1) (w p2)', p1=patch_size, p2=patch_size, h=image_size//patch_size)
+        self.init_weight()
+
+    def init_weight(self):
+        trunc_normal_(self.pos_embedding, std=.02)
+
+    def forward(self, z, img): # [512, 3, 32, 32]
+        z_token = self.essence_projection(z)  # (batch, emb_dim)
+        z_token = rearrange(z_token, 'b c -> 1 b c')  # (1, batch, emb_dim)
+
+        patches = self.patchify(img) # [512, 192, 16, 16]
+        patches = rearrange(patches, 'b c h w -> (h w) b c') # [256, 512, 192]
+        patches = torch.cat([z_token, patches], dim=0)
+        
+        features = patches + self.pos_embedding
+        
+        features = rearrange(features, 't b c -> b t c')
+        features = self.layer_norm(self.transformer(features))
+        features = rearrange(features, 'b t c -> t b c')
+        features = features[1:]  # (num_patches, batch, emb_dim)
+        
+        # Generate patches
+        patches = self.head(features)
+        img = self.patch2img(patches)
+        return img
+    
 class SimpleDecoder(torch.nn.Module):
     def __init__(self, image_size=32, patch_size=2, emb_dim=192, num_layer=4, num_head=3, latent_dim=64):
         super().__init__()
@@ -240,15 +275,15 @@ class SimpleViT(torch.nn.Module):
         super().__init__()
         self.encoder = SimpleEncoder(image_size, patch_size, emb_dim, encoder_layer, encoder_head)
         self.essence_extractor = SimpleEssenceExtractor(emb_dim, latent_dim)
-        self.decoder = SimpleDecoder(image_size, patch_size, emb_dim, decoder_layer, decoder_head, latent_dim)
+        self.decoder = SimpleEncoderDecoder(image_size, patch_size, emb_dim, decoder_layer, decoder_head, latent_dim)
 
     def forward(self, img1, img2):
-        x1 = self.encoder(img1)  # (num_patches, batch, emb_dim)
-        x2 = self.encoder(img2)  # (num_patches, batch, emb_dim)
-        z = self.essence_extractor(x2 - x1)  # (batch, latent_dim)
-        img2_pred = self.decoder(z, x1)  # (batch, 3, height, width)
-        
-        return img2_pred 
+        x1 = self.encoder(img2 - img1)  # (num_patches, batch, emb_dim)
+        # x2 = self.encoder(img2)  # (num_patches, batch, emb_dim)
+        z = self.essence_extractor(x1)  # (batch, latent_dim)
+        img2_pred = self.decoder(z, img1)  # (batch, 3, height, width)
+
+        return img2_pred
 
 
 if __name__ == '__main__':
