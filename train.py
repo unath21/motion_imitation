@@ -11,7 +11,7 @@ from tqdm import tqdm
 from einops import rearrange
 import torch.nn.functional as F
 
-from model_mimic import SimpleViT
+from models import *
 from utils import setup_seed
 from simple_pair_dataset import SimplePairDataset
 
@@ -157,9 +157,9 @@ if __name__ == '__main__':
         split='val'  # Different split for different augmentations
     )
     
-    dataloader = torch.utils.data.DataLoader(train_dataset, load_batch_size, shuffle=True, num_workers=config['data']['num_workers'])
-    val_dataloader = torch.utils.data.DataLoader(val_dataset, load_batch_size, shuffle=False, num_workers=config['data']['num_workers'])
-    
+    dataloader = torch.utils.data.DataLoader(train_dataset, load_batch_size, shuffle=True, num_workers=config['data']['num_workers'], pin_memory=True, persistent_workers=True)
+    val_dataloader = torch.utils.data.DataLoader(val_dataset, load_batch_size, shuffle=False, num_workers=config['data']['num_workers'], pin_memory=True, persistent_workers=True)
+
     # Create tensorboard writer (only on main process)
     if accelerator.is_main_process:
         writer = SummaryWriter(config['logging']['tensorboard_log_dir'])
@@ -167,13 +167,10 @@ if __name__ == '__main__':
         writer = None
 
     if config['model']['type'] == 'autoencoder':
-        from model_auto import Autoencoder
         model = Autoencoder(
             in_channels=3,
             out_channels=3,
-            z_channels=4,
-            sample_size=config['model']['image_size'],
-            essence_dim=64
+            z_channels=64
         )
     elif config['model']['type'] == 'simplevit':
         model = SimpleViT(
@@ -199,6 +196,7 @@ if __name__ == '__main__':
     model, optim, lr_scheduler, dataloader, val_dataloader = accelerator.prepare(
         model, optim, lr_scheduler, dataloader, val_dataloader
     )
+    # print(model)
     
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in model.parameters())

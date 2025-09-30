@@ -12,7 +12,7 @@ data:
   train_pairs_json: "./data/train_pairs_2.json"  # JSON file with frame pairs for training
   val_pairs_json: "./data/val_pairs_2.json"      # JSON file with frame pairs for validation
   frame_size: 256                       # Size to resize frames to
-  num_workers: 8                        # Number of data loading workers
+  num_workers: 32                        # Number of data loading workers
 
 # Model parameters
 model:
@@ -24,7 +24,7 @@ model:
 # Training parameters
 train:
   batch_size: 512
-  max_device_batch_size: 16
+  max_device_batch_size: 64
   base_learning_rate: 1.5e-4
   weight_decay: 0.05
   gradient_clip_norm: 1.0
