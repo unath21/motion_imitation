@@ -170,7 +170,7 @@ if __name__ == '__main__':
         model = Autoencoder(
             in_channels=3,
             out_channels=3,
-            z_channels=64
+            z_channels=config['model']['latent_dim']
         )
     elif config['model']['type'] == 'simplevit':
         model = SimpleViT(
@@ -197,6 +197,7 @@ if __name__ == '__main__':
         model, optim, lr_scheduler, dataloader, val_dataloader
     )
     # print(model)
+    # exit()
     
     if accelerator.is_main_process:
         total_params = sum(p.numel() for p in model.parameters())

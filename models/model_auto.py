@@ -5,6 +5,7 @@ from einops import rearrange
 
 from diffusers.models.autoencoders.vae import Encoder
 
+
 class FiLM2d(nn.Module):
 	def __init__(self, channels: int, cond_dim: int):
 		super().__init__()
@@ -13,7 +14,6 @@ class FiLM2d(nn.Module):
 		self.mlp = nn.Linear(cond_dim, 2 * channels)
 		nn.init.zeros_(self.mlp.weight)
 		nn.init.zeros_(self.mlp.bias)
-
 		with torch.no_grad():
 			self.mlp.bias[:channels].fill_(1.0)
 
@@ -26,34 +26,42 @@ class FiLM2d(nn.Module):
 		beta = beta.view(B, C, 1, 1)
 		return gamma * x + beta
 
+
 class ResNetBlock2D(nn.Module):
-	"""ResNet block with FiLM conditioning"""
 	def __init__(self, in_channels, out_channels, cond_dim=None, stride=1):
 		super().__init__()
 		self.in_channels = in_channels
 		self.out_channels = out_channels
 
+		# First conv block
 		self.norm1 = nn.GroupNorm(min(32, in_channels), in_channels)
 		self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
-							  stride=stride, padding=1, bias=False)
+							   stride=stride, padding=1, bias=False)
 
 		# Second conv block
 		self.norm2 = nn.GroupNorm(min(32, out_channels), out_channels)
 		self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
-							  stride=1, padding=1, bias=False)
+							   stride=1, padding=1, bias=False)
 
 		# FiLM conditioning
 		self.film1 = FiLM2d(out_channels, cond_dim) if cond_dim else None
 		self.film2 = FiLM2d(out_channels, cond_dim) if cond_dim else None
 
+		if stride != 1 or in_channels != out_channels:
+			self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1,
+								  stride=stride, bias=False)
+		else:
+			self.skip = nn.Identity()
+
 		self.activation = nn.SiLU()
 
 	def forward(self, x, cond=None):
+		skip = self.skip(x)
+
 		# First conv
 		h = self.norm1(x)
 		h = self.activation(h)
 		h = self.conv1(h)
-
 		if self.film1 is not None and cond is not None:
 			h = self.film1(h, cond)
 
@@ -61,23 +69,19 @@ class ResNetBlock2D(nn.Module):
 		h = self.norm2(h)
 		h = self.activation(h)
 		h = self.conv2(h)
-
-		# FiLM conditioning after second conv
 		if self.film2 is not None and cond is not None:
 			h = self.film2(h, cond)
 
-		return h
+		return h + skip
+
 
 class DownBlock2D(nn.Module):
-	"""Downsampling block with ResNet blocks and FiLM"""
 	def __init__(self, in_channels, out_channels, num_layers=2, cond_dim=None):
 		super().__init__()
 
 		layers = []
-		# First layer with downsampling
 		layers.append(ResNetBlock2D(in_channels, out_channels, cond_dim, stride=2))
 
-		# Additional layers
 		for _ in range(num_layers - 1):
 			layers.append(ResNetBlock2D(out_channels, out_channels, cond_dim))
 
@@ -88,32 +92,42 @@ class DownBlock2D(nn.Module):
 			x = layer(x, cond)
 		return x
 
+
 class UpBlock2D(nn.Module):
-	"""Upsampling block with ResNet blocks and FiLM"""
-	def __init__(self, in_channels, out_channels, num_layers=2, cond_dim=None):
+	def __init__(self, in_channels, out_channels, num_layers=2, cond_dim=None, skip_channels=None):
 		super().__init__()
 
-		# Upsample layer
-		self.upsample = nn.ConvTranspose2d(in_channels, in_channels,
-										  kernel_size=2, stride=2)
+		self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
+		if skip_channels is None:
+			skip_channels = out_channels
+
 		layers = []
-		# Additional layers
-		layers.append(ResNetBlock2D(in_channels, out_channels, cond_dim))
+		first_in = out_channels + skip_channels
+		layers.append(ResNetBlock2D(first_in, out_channels, cond_dim))
+
 		for _ in range(num_layers - 1):
 			layers.append(ResNetBlock2D(out_channels, out_channels, cond_dim))
 
 		self.layers = nn.ModuleList(layers)
 
-
-	def forward(self, x, cond=None):
+	def forward(self, x, skip=None, cond=None):
 		# Upsample
 		x = self.upsample(x)
 
-		# Apply ResNet blocks
+		if skip is not None:
+			dh = skip.shape[2] - x.shape[2]
+			dw = skip.shape[3] - x.shape[3]
+			pad = [dw // 2, dw - dw // 2, dh // 2, dh - dh // 2]
+			if any(p != 0 for p in pad):
+				x = F.pad(x, pad)
+			x = torch.cat([skip, x], dim=1)
+
 		for layer in self.layers:
 			x = layer(x, cond)
 
 		return x
+
 
 class UNet2DConditionModel(nn.Module):
 	def __init__(self, in_channels=3, out_channels=3, cond_dim=64,
@@ -127,46 +141,43 @@ class UNet2DConditionModel(nn.Module):
 		self.conv_in = nn.Conv2d(in_channels, block_out_channels[0],
 								 kernel_size=3, padding=1)
 
-		# ---------------- Encoder ----------------
 		self.down_blocks = nn.ModuleList()
 		in_ch = block_out_channels[0]
-
 		for out_ch in block_out_channels:
 			self.down_blocks.append(
 				DownBlock2D(in_ch, out_ch, layers_per_block, cond_dim)
 			)
 			in_ch = out_ch
 
-		# ---------------- Decoder ----------------
 		self.up_blocks = nn.ModuleList()
 		reversed_channels = list(reversed(block_out_channels))
-
-		for out_ch in reversed_channels:
+		in_ch = block_out_channels[-1]
+		for i, out_ch in enumerate(reversed_channels):
 			self.up_blocks.append(
-				UpBlock2D(in_ch, out_ch, layers_per_block, cond_dim)
+				UpBlock2D(in_ch, out_ch, layers_per_block, cond_dim, skip_channels=out_ch)
 			)
 			in_ch = out_ch
 
-		# Output convolution
 		self.conv_out = nn.Sequential(
-			nn.GroupNorm(min(32, in_ch), in_ch),
+			nn.ConvTranspose2d(block_out_channels[0], block_out_channels[0], kernel_size=2, stride=2),
+			
+			nn.GroupNorm(min(32, block_out_channels[0]), block_out_channels[0]),
 			nn.SiLU(),
-			nn.Conv2d(in_ch, out_channels, kernel_size=3, padding=1)
+			nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
 		)
 
 	def forward(self, sample, cond=None, return_dict=False):
-		# Initial conv
 		x = self.conv_in(sample)
 
-		# Encoder
+		skips = []
 		for down_block in self.down_blocks:
 			x = down_block(x, cond)
+			skips.append(x)
 
-		# Decoder (no skips)
-		for up_block in self.up_blocks:
-			x = up_block(x, cond)
+		for idx, up_block in enumerate(self.up_blocks):
+			skip = skips.pop() if len(skips) > 0 else None
+			x = up_block(x, skip=skip, cond=cond)
 
-		# Output
 		x = self.conv_out(x)
 
 		if return_dict:
@@ -180,7 +191,7 @@ class Autoencoder(nn.Module):
 		self.encoder = Encoder(
 			in_channels=in_channels,
 			out_channels=z_channels,
-			down_block_types=("DownEncoderBlock2D","DownEncoderBlock2D","DownEncoderBlock2D"),
+			down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
 			block_out_channels=(64, 128, 256),
 			layers_per_block=1,
 			act_fn='silu',
@@ -191,7 +202,6 @@ class Autoencoder(nn.Module):
 
 		self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-		# Replace decoder with UNet2DConditionModel
 		self.decoder = UNet2DConditionModel(
 			in_channels=in_channels,
 			out_channels=out_channels,
@@ -202,14 +212,9 @@ class Autoencoder(nn.Module):
 
 	def forward(self, x1, x2):
 		z_diff = self.encoder(x2 - x1)  # [B, z_channels, H', W']
-		
 		z_diff = z_diff.view(z_diff.size(0), z_diff.size(1), -1)  # [B, z_channels, N]
 		z_diff = self.global_pool(z_diff).squeeze(-1)  # [B, z_channels]
 
 		# Decode using UNet2D
-		recon = self.decoder(
-			sample=x1,
-			cond=z_diff,
-			return_dict=False
-		)[0]  # UNet returns a tuple, we want the sample
+		recon = self.decoder(sample=x1, cond=z_diff, return_dict=False)[0]
 		return recon

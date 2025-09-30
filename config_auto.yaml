@@ -2,8 +2,8 @@
 
 # General training parameters
 seed: 42
-total_epoch: 2000
-warmup_epoch: 200
+total_epoch: 100
+warmup_epoch: 5
 
 # Data parameters
 # Data configuration
@@ -19,7 +19,7 @@ model:
   type: "autoencoder"  # Options: "autoencoder", "simplevit"
   image_size: 256
   patch_size: 16
-  latent_dim: 64
+  latent_dim: 128
 
 # Training parameters
 train:
@@ -31,25 +31,25 @@ train:
 
 # Accelerate configuration
 accelerate:
-  mixed_precision: 'fp16'  # Options: 'no', 'fp16', 'bf16'
+  mixed_precision: 'bf16'  # Options: 'no', 'fp16', 'bf16'
   gradient_accumulation_steps: 1
   config_file: './accelerate_config.yaml'
 
 # Logging parameters
 logging:
-  model_save_path: '/scratch/rgoel15/motion_emitation_data/model_mimic/simplevit_mae.pt'
+  model_save_path: '/scratch/rgoel15/motion_emitation_data/model_mimic/auto_unet.pt'
   tensorboard_log_dir: '/scratch/rgoel15/motion_emitation_data/tensorboard_logs'
 
 # WandB configuration
 wandb:
   enable: true
   project: 'motion_emitation'
-  run_name: 'simplevit'
+  run_name: 'auto_unet'
   mode: 'online'  # Options: 'online', 'offline', 'disabled'
   dir: '/scratch/rgoel15/motion_emitation_data/wandb_logs'
 
 # Validation parameters
 validation:
-  log_images_every: 10
-  num_samples_to_log: 8
+  log_images_every: 5
+  num_samples_to_log: 10
   save_model_every: 50  # Save model every N epochs
