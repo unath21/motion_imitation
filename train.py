@@ -190,12 +190,15 @@ if __name__ == '__main__':
     )
     lr_func = lambda epoch: min((epoch + 1) / (config['warmup_epoch'] + 1e-8), 
                                0.5 * (math.cos(epoch / config['total_epoch'] * math.pi) + 1))
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_func, verbose=accelerator.is_main_process)
+    # lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=lr_func, verbose=accelerator.is_main_process)
 
     # Prepare model, optimizer, scheduler and dataloaders with accelerate
-    model, optim, lr_scheduler, dataloader, val_dataloader = accelerator.prepare(
-        model, optim, lr_scheduler, dataloader, val_dataloader
+    model, optim, dataloader, val_dataloader = accelerator.prepare(
+        model, optim, dataloader, val_dataloader
     )
+    # model, optim, lr_scheduler, dataloader, val_dataloader = accelerator.prepare(
+    #     model, optim, lr_scheduler, dataloader, val_dataloader
+    # )
     # print(model)
     # exit()
     
@@ -232,7 +235,7 @@ if __name__ == '__main__':
             loss_gathered = accelerator.gather_for_metrics(loss)
             losses.append(loss_gathered.mean().item())
         # Step scheduler
-        lr_scheduler.step()
+        # lr_scheduler.step()
         
         # Calculate average loss
         avg_loss = sum(losses) / len(losses)
@@ -241,7 +244,8 @@ if __name__ == '__main__':
         if accelerator.is_main_process:
             if writer is not None:
                 writer.add_scalar('reconstruction_loss', avg_loss, global_step=e)
-                current_lr = lr_scheduler.get_last_lr()[0]
+                # current_lr = lr_scheduler.get_last_lr()[0]
+                current_lr = base_lr
                 writer.add_scalar('learning_rate', current_lr, global_step=e)
             
             # WandB logging
@@ -256,9 +260,10 @@ if __name__ == '__main__':
                 if e % config['validation']['log_images_every'] == 0:
                     # Get a batch for training visualization
                     train_batch = next(iter(dataloader))
-                    train_img1 = train_batch['img1'][:8]  # First 8 training samples
-                    train_img2 = train_batch['img2'][:8]  # Target images
-                    
+                    train_img1 = train_batch['img1'][:config['validation']['num_samples_to_log']]  # First 8 training samples
+                    train_img2 = train_batch['img2'][:config['validation']['num_samples_to_log']]  # Target images
+                    train_delta = train_batch['delta'][:config['validation']['num_samples_to_log']]  # Deltas
+
                     model.eval()
                     with torch.no_grad():
                         with accelerator.autocast():
@@ -282,7 +287,7 @@ if __name__ == '__main__':
                         # Row = [img1 | pred | target] concatenated along width
                         row = torch.cat([train_img1_vis[i], predicted_train_vis[i], train_img2_vis[i]], dim=2)  # [C,H,3W]
                         row_np = (row.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
-                        train_rows.append(wandb.Image(row_np, caption=f"Epoch {e} • train sample {i}: Input | Pred | Target"))
+                        train_rows.append(wandb.Image(row_np, caption=f"Epoch {e} • train sample {i}: Input | Pred | Target • Δ: {train_delta[i].cpu().numpy()}"))
                     
                     wandb_log_dict['train/comparisons_list'] = train_rows
                 
@@ -297,7 +302,8 @@ if __name__ == '__main__':
                 val_batch = next(iter(val_dataloader))
                 val_img1 = val_batch['img1'][:config['validation']['num_samples_to_log']]
                 val_img2 = val_batch['img2'][:config['validation']['num_samples_to_log']]
-                
+                val_delta = val_batch['delta'][:config['validation']['num_samples_to_log']]
+
                 with accelerator.autocast():
                     predicted_val_img2 = model(val_img1, val_img2)
                 
@@ -324,7 +330,7 @@ if __name__ == '__main__':
                             # Row = [img1 | pred | target] concatenated along width
                             row = torch.cat([val_img1_vis[i], predicted_vis[i], val_img2_vis[i]], dim=2)  # [C,H,3W]
                             row_np = (row.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
-                            rows.append(wandb.Image(row_np, caption=f"Epoch {e} • sample {i}: Input | Pred | Target "))
+                            rows.append(wandb.Image(row_np, caption=f"Epoch {e} • sample {i}: Input | Pred | Target • Δ: {val_delta[i].cpu().numpy()}"))
 
                         wandb_run.log({'validation/comparisons_list': rows}, step=e)
                     
