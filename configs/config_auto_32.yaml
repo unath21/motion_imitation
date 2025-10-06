@@ -2,15 +2,15 @@
 
 # General training parameters
 seed: 42
-total_epoch: 100
+total_epoch: 1000
 warmup_epoch: 5
 
 # Data parameters
 # Data configuration
 data:
   root: "/data/pturaga/datasets/Penn_Action/"  # Path to Penn Action frames directory
-  train_pairs_json: "./data/train_pairs_2.json"  # JSON file with frame pairs for training
-  val_pairs_json: "./data/val_pairs_2.json"      # JSON file with frame pairs for validation
+  train_pairs_json: "./data/train_pairs_3.json"  # JSON file with frame pairs for training
+  val_pairs_json: "./data/val_pairs_3.json"      # JSON file with frame pairs for validation
   frame_size: 256                       # Size to resize frames to
   num_workers: 32                        # Number of data loading workers
 
@@ -19,7 +19,7 @@ model:
   type: "autoencoder"  # Options: "autoencoder", "simplevit"
   image_size: 256
   patch_size: 16
-  latent_dim: 64
+  latent_dim: 32
 
 # Training parameters
 train:
@@ -37,19 +37,19 @@ accelerate:
 
 # Logging parameters
 logging:
-  model_save_path: '/scratch/rgoel15/motion_emitation_data/model_mimic/auto_unet.pt'
+  model_save_path: '/scratch/rgoel15/motion_emitation_data/model_mimic/auto_unet_32.pt'
   tensorboard_log_dir: '/scratch/rgoel15/motion_emitation_data/tensorboard_logs'
 
 # WandB configuration
 wandb:
   enable: true
   project: 'motion_emitation'
-  run_name: 'auto_unet'
+  run_name: 'auto_unet_32'
   mode: 'online'  # Options: 'online', 'offline', 'disabled'
   dir: '/scratch/rgoel15/motion_emitation_data/wandb_logs'
 
 # Validation parameters
 validation:
   log_images_every: 5
-  num_samples_to_log: 10
+  num_samples_to_log: 40
   save_model_every: 50  # Save model every N epochs
