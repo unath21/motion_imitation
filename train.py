@@ -23,68 +23,75 @@ def load_config(config_path):
 	return config
 
 def save_checkpoint(accelerator, model, optimizer, epoch, loss, checkpoint_path):
-	"""Save training checkpoint."""
+	"""Save training checkpoint, compatible with torch.compile() and Accelerate."""
 	if accelerator.is_main_process:
+		# Unwrap the model (Accelerate handles DDP)
+		unwrapped_model = accelerator.unwrap_model(model)
+
+		# If the model is compiled, get the original module
+		if hasattr(unwrapped_model, '_orig_mod'):
+			unwrapped_model = unwrapped_model._orig_mod
+
+		clean_state_dict = unwrapped_model.state_dict()
+
 		checkpoint = {
 			'epoch': epoch,
-			'model_state_dict': accelerator.unwrap_model(model).state_dict(),
+			'model_state_dict': clean_state_dict,  # Save clean state dict
 			'optimizer_state_dict': optimizer.state_dict(),
 			'loss': loss,
 		}
+
 		torch.save(checkpoint, checkpoint_path)
-		print(f"Checkpoint saved at epoch {epoch}: {checkpoint_path}")
+		print(f"✅ Checkpoint saved (epoch {epoch}) at: {checkpoint_path}")
+
 
 def load_checkpoint(accelerator, model, optimizer, checkpoint_path):
-	"""Load training checkpoint with backward compatibility."""
-	if os.path.exists(checkpoint_path):
-		print(f"Loading checkpoint from: {checkpoint_path}")
-		checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
-
-		# Check if this is a new checkpoint format (dict) or old model-only format
-		if isinstance(checkpoint, dict):
-			# New checkpoint format
-			if 'model_state_dict' in checkpoint:
-				# Load model state
-				accelerator.unwrap_model(model).load_state_dict(checkpoint['model_state_dict'])
-				print("Loaded model state from checkpoint")
-
-				# Load optimizer state if available and if optimizer is provided
-				if 'optimizer_state_dict' in checkpoint and optimizer is not None:
-					try:
-						optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-						print("Loaded optimizer state from checkpoint")
-					except Exception as e:
-						print(f"Warning: Could not load optimizer state: {e}")
-						print("Continuing with fresh optimizer state")
-
-				# Get epoch and loss if available
-				start_epoch = checkpoint.get('epoch', 0) + 1
-				last_loss = checkpoint.get('loss', None)
-
-				print(f"Resumed from epoch {checkpoint.get('epoch', 0)}, last loss: {last_loss}")
-				return start_epoch, last_loss
-			else:
-				print("Warning: Checkpoint is a dict but doesn't contain expected keys")
-				return 0, None
-		else:
-			# Old checkpoint format - assume it's a model object or state dict
-			try:
-				if hasattr(checkpoint, 'state_dict'):
-					# It's a model object
-					accelerator.unwrap_model(model).load_state_dict(checkpoint.state_dict())
-				else:
-					# It's a state dict
-					accelerator.unwrap_model(model).load_state_dict(checkpoint)
-
-				print("Loaded model from old checkpoint format (model-only)")
-				print("Starting from epoch 0 with fresh optimizer")
-				return 0, None
-			except Exception as e:
-				print(f"Error loading old checkpoint format: {e}")
-				return 0, None
-	else:
-		print(f"No checkpoint found at: {checkpoint_path}")
+	"""Load training checkpoint with compatibility for torch.compile() and Accelerate."""
+	if not os.path.exists(checkpoint_path):
+		print(f"⚠️ No checkpoint found at: {checkpoint_path}")
 		return 0, None
+
+	print(f"📂 Loading checkpoint from: {checkpoint_path}")
+	checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+	# Unwrap model for loading
+	unwrapped_model = accelerator.unwrap_model(model)
+	is_compiled_model = hasattr(unwrapped_model, '_orig_mod')
+
+	model_to_load = unwrapped_model._orig_mod if is_compiled_model else unwrapped_model
+	checkpoint_state_dict = checkpoint.get('model_state_dict', checkpoint)
+
+	# Handle potential prefix mismatch for compiled models
+	if is_compiled_model:
+		model_keys = model_to_load.state_dict().keys()
+		has_prefix_in_model = any(k.startswith('_orig_mod.') for k in model_keys)
+		has_prefix_in_ckpt = any(k.startswith('_orig_mod.') for k in checkpoint_state_dict)
+
+		if has_prefix_in_model and not has_prefix_in_ckpt:
+			print("ℹ️ Adding '_orig_mod.' prefix to checkpoint keys for compiled model.")
+			checkpoint_state_dict = {'_orig_mod.' + k: v for k, v in checkpoint_state_dict.items()}
+
+	# Try to load model weights
+	try:
+		model_to_load.load_state_dict(checkpoint_state_dict)
+		print("✅ Model weights loaded successfully.")
+	except Exception as e:
+		print(f"⚠️ Error loading model state_dict: {e}")
+		return 0, None
+
+	# Try to load optimizer
+	if 'optimizer_state_dict' in checkpoint and optimizer is not None:
+		try:
+			optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+			print("✅ Optimizer state loaded successfully.")
+		except Exception as e:
+			print(f"⚠️ Could not load optimizer state: {e}")
+
+	start_epoch = checkpoint.get('epoch', 0) + 1
+	last_loss = checkpoint.get('loss', None)
+	print(f"Resumed from epoch {checkpoint.get('epoch', 0)}, last loss: {last_loss}")
+	return start_epoch, last_loss
+
 
 try:
 	from accelerate import Accelerator
@@ -119,6 +126,11 @@ if __name__ == '__main__':
 					   help='WandB mode')
 	parser.add_argument('--resume', type=str, default=None,
 					   help='Path to checkpoint to resume from')
+	parser.add_argument('--save_dir', type=str, required=True)
+	parser.add_argument('--dino_correspondence', action='store_true', default=False, help='Enable dual guidance with DINO features and image subtraction')
+	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'dino'], required=True, help='Model type to use')
+	parser.add_argument('--data_type', type=str, choices=['simple', 'dino'], help='Type of dataset to use')
+	parser.add_argument('--wandb_name', type=str, help='WandB run name')
 
 	args = parser.parse_args()
 
@@ -151,6 +163,17 @@ if __name__ == '__main__':
 		config['accelerate']['mixed_precision'] = args.mixed_precision
 	if args.wandb_mode is not None:
 		config['wandb']['mode'] = args.wandb_mode
+	if args.save_dir is not None:
+		config['logging']['model_save_path'] = args.save_dir
+		os.makedirs(args.save_dir, exist_ok=True)
+	if args.dino_correspondence is not None:
+		config['model']['dino_correspondence'] = args.dino_correspondence
+	if args.model is not None:
+		config['model']['type'] = args.model
+	if args.data_type is not None:
+		config['data']['type'] = args.data_type
+	if args.wandb_name is not None:
+		config['wandb']['run_name'] = args.wandb_name
 
 	print(f"Loaded config from: {args.config}")
 
@@ -243,6 +266,16 @@ if __name__ == '__main__':
 	dataloader = torch.utils.data.DataLoader(train_dataset, load_batch_size, shuffle=True, num_workers=config['data']['num_workers'], pin_memory=True, persistent_workers=True)
 	val_dataloader = torch.utils.data.DataLoader(val_dataset, load_batch_size, shuffle=False, num_workers=config['data']['num_workers'], pin_memory=True, persistent_workers=True)
 
+	# Cache fixed visualization batch once
+	fixed_train_batch = next(iter(torch.utils.data.DataLoader(
+		train_dataset,
+		batch_size=config['validation']['num_samples_to_log'],
+		shuffle=False,
+		num_workers=config['data']['num_workers'],
+		pin_memory=True
+	)))
+
+
 	# Create tensorboard writer (only on main process)
 	if accelerator.is_main_process:
 		writer = SummaryWriter(config['logging']['tensorboard_log_dir'])
@@ -263,10 +296,16 @@ if __name__ == '__main__':
 		)
 	elif config['model']['type'] == 'dino':
 		model = AutoencoderDINO(
-			in_channels=9,
+			in_channels=3,
 			out_channels=3,
-			z_channels=config['model']['latent_dim']
+			z_channels=config['model']['latent_dim'],
+			dino_correspondence=config['model']['dino_correspondence']
 		)
+	
+	model = torch.compile(model, mode='reduce-overhead', fullgraph=False)
+
+	if accelerator.is_main_process:
+		print(str(model))
 
 	# Adjust learning rate for effective batch size
 	base_lr = config['train']['base_learning_rate'] * effective_batch_size / 256
@@ -376,7 +415,8 @@ if __name__ == '__main__':
 				# Log training images periodically
 				if e % config['validation']['log_images_every'] == 0:
 					# Get a batch for training visualization
-					train_batch = next(iter(dataloader))
+					# train_batch = next(iter(dataloader))
+					train_batch = fixed_train_batch
 					train_img1 = train_batch['img1'][:config['validation']['num_samples_to_log']]
 					train_img2 = train_batch['img2'][:config['validation']['num_samples_to_log']]
 					train_delta = train_batch['delta'][:config['validation']['num_samples_to_log']]
@@ -407,7 +447,7 @@ if __name__ == '__main__':
 					train_rows = []
 					B = train_img1_vis.shape[0]
 					for i in range(B):
-						row = torch.cat([train_img1_vis[i], predicted_train_vis[i], train_img2_vis[i]], dim=2)
+						row = torch.cat([train_img1_vis[i].cpu(), predicted_train_vis[i].cpu(), train_img2_vis[i].cpu()], dim=2)
 						row_np = (row.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
 						train_rows.append(wandb.Image(row_np, caption=f"Epoch {e} • train sample {i}: Input | Pred | Target • Δ: {train_delta[i].cpu().numpy()}"))
 

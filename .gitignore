@@ -1,3 +1,10 @@
 __pycache__/
 logs/
 *.pt
+wandb/
+data/jsons/
+remove_duplicates.py
+score_and_rank_pairs.py
+stats.py
+data/generate_dino_features.py
+data/generate_dino_features_ddp.py

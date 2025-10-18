@@ -40,7 +40,7 @@ import scipy.io as sio
 
 # -----------------------------------------------------
 
-def scan_videos(root: str, action_list: List[str]):
+def scan_videos(root: str):
     frames_dir = os.path.join(root, 'frames')
     labels_dir = os.path.join(root, 'labels')
     videos = []
@@ -61,9 +61,6 @@ def scan_videos(root: str, action_list: List[str]):
         frame_files.sort()
         n = len(frame_files)
         if n < 2:
-            continue
-        if action not in action_list:
-            print(action)
             continue
         videos.append({
             'video_id': vid,
@@ -86,48 +83,20 @@ def sample_pairs(videos: List[Dict[str, Any]], num_pairs: int, delta_min: int, d
 
     pairs: List[Dict[str, int]] = []
 
-    # Precompute delta cycle for balanced distribution if requested.
-    if balance_delta:
-        delta_cycle = []
-        for d in range(delta_min, delta_max + 1):
-            delta_cycle.append(d)
-        cycle_len = len(delta_cycle)
-    else:
-        delta_cycle = None
-
-    for i in range(num_pairs):
-        vid = rng.choice(usable)
+    for i, vid in enumerate(usable):
         n = vid['num_frames']
-        # Choose delta
-        if delta_cycle is not None:
-            delta = delta_cycle[i % len(delta_cycle)]
-            # If delta too large for this video, fallback to max possible
-            if delta >= n:
-                delta = min(max(1, n - 1), delta)
-        else:
-            # Random delta
-            if n - 1 < delta_min:
-                # Very short video edge case
-                delta = 1
-            else:
-                max_delta_allowed = min(delta_max, n - 1)
-                delta = rng.randint(delta_min, max_delta_allowed)
-        max_start = n - delta - 1
-        if max_start < 0:
-            # Fallback: last two frames
-            i1 = n - 2
-            i2 = n - 1
-            delta = 1
-        else:
-            i1 = rng.randint(0, max_start)
-            i2 = i1 + delta
-        pairs.append({
-            'video_id': vid['video_id'],
-            'i1': i1,
-            'i2': i2,
-            'delta': delta,
-            'action': vid['action'],
-        })
+
+        for j in range(n - delta_min):
+            i1 = j
+            i2 = j + delta_min
+            pairs.append({
+                'video_id': vid['video_id'],
+                'i1': i1,
+                'i2': i2,
+                'delta': delta_min,
+                'action': vid['action'],
+            })
+
     return pairs
 
 # -----------------------------------------------------
@@ -150,7 +119,7 @@ def main():
 
     print('[INFO] Scanning videos...')
     action_list = args.action_list
-    videos = scan_videos(args.root, action_list)
+    videos = scan_videos(args.root)
     train_videos = [v for v in videos if v['train_flag'] == 1]
     val_videos = [v for v in videos if v['train_flag'] != 1]
 

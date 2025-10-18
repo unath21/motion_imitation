@@ -38,7 +38,7 @@ class SimplePairDINODataset(Dataset):
         assert os.path.isdir(root), f"Root not found: {root}"
         self.root = root
         self.frames_dir = os.path.join(root, "frames")
-        self.dino_features_dir = os.path.join(root, "dino_features_pca")
+        self.dino_features_dir = os.path.join(root, "dino_features")
         self.frame_size = frame_size
         self.split = split
         self.rng = random.Random(seed)
@@ -98,22 +98,7 @@ class SimplePairDINODataset(Dataset):
         path = os.path.join(self.dino_features_dir, video_id, frame_file.replace('.jpg', '.npy'))
         if not os.path.isfile(path):
             raise FileNotFoundError(f"DINO features not found: {path}")
-        features = np.load(path)
-        h, w = features.shape[0], features.shape[1]
-        target_size = self.frame_size + 32
-        scale = target_size / min(h, w)
-        nh, nw = int(round(h * scale)), int(round(w * scale))
-        features = cv2.resize(features, (nw, nh), interpolation=cv2.INTER_LINEAR)
-
-        h, w = features.shape[0], features.shape[1]
-        if self.split == 'train':
-            y = self.rng.randint(0, max(0, h - self.frame_size))
-            x = self.rng.randint(0, max(0, w - self.frame_size))
-        else:
-            y = max(0, (h - self.frame_size) // 2)
-            x = max(0, (w - self.frame_size) // 2)
-        cropped = features[y:y+self.frame_size, x:x+self.frame_size]
-        return cropped
+        return np.load(path)
 
     def _resize_and_crop(self, img):
         """Resize and crop image to target size"""
@@ -139,17 +124,15 @@ class SimplePairDINODataset(Dataset):
         cropped = img[y:y+self.frame_size, x:x+self.frame_size]
         return cropped
 
-    def _apply_augmentations(self, img1, img2, dino1, dino2):
+    def _apply_augmentations(self, img1, img2):
         """Apply simple augmentations for training"""
         if self.split != 'train':
-            return img1, img2, dino1, dino2
+            return img1, img2
 
         # Horizontal flip (same for both images)
         if self.rng.random() < 0.5:
             img1 = cv2.flip(img1, 1)
             img2 = cv2.flip(img2, 1)
-            dino1 = cv2.flip(dino1, 1)
-            dino2 = cv2.flip(dino2, 1)
         
         # Simple color jitter (same for both to maintain consistency)
         if self.rng.random() < 0.3:
@@ -163,7 +146,7 @@ class SimplePairDINODataset(Dataset):
             img1 = apply_jitter(img1)
             img2 = apply_jitter(img2)
         
-        return img1, img2, dino1, dino2
+        return img1, img2
 
     def _to_tensor(self, img):
         """Convert numpy image to tensor with ImageNet normalization"""
@@ -240,7 +223,7 @@ class SimplePairDINODataset(Dataset):
         img2 = img2[y2:y2+self.frame_size, x2:x2+self.frame_size]
         
         # Apply augmentations
-        img1, img2, dino1, dino2 = self._apply_augmentations(img1, img2, dino1, dino2)
+        img1, img2 = self._apply_augmentations(img1, img2)
         
         # Convert to tensors
         tensor1 = self._to_tensor(img1)
@@ -249,8 +232,8 @@ class SimplePairDINODataset(Dataset):
         return {
             'img1': tensor1,           # First image
             'img2': tensor2,           # Second image
-            'dino1': torch.from_numpy(dino1).float().permute(2, 0, 1),  # DINO features for img1
-            'dino2': torch.from_numpy(dino2).float().permute(2, 0, 1),  # DINO
+            'dino1': torch.from_numpy(dino1).float(),  # DINO features for img1
+            'dino2': torch.from_numpy(dino2).float(),  # DINO features for img2
             'video_id': vid,           # Video identifier
             'frame_idx1': int(i1),     # First frame index
             'frame_idx2': int(i2),     # Second frame index
