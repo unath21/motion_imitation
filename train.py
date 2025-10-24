@@ -11,7 +11,7 @@ from tqdm import tqdm
 from einops import rearrange
 import torch.nn.functional as F
 
-from models import *
+from models import Autoencoder, AutoencoderDINOCorrespondence, AutoencoderMaskedInputs, AutoencoderLatentInputs, AutoencoderV2, SimpleViT
 from utils import setup_seed
 from simple_pair_dataset import SimplePairDataset
 from diffusers import AutoencoderKL
@@ -129,7 +129,7 @@ if __name__ == '__main__':
 					   help='Path to checkpoint to resume from')
 	parser.add_argument('--save_dir', type=str, required=True)
 	parser.add_argument('--dino_correspondence', action='store_true', default=False, help='Enable dual guidance with DINO features and image subtraction')
-	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'dino', 'masked_inputs', 'vae'], required=True, help='Model type to use')
+	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'dino', 'masked_inputs', 'vae', 'v2'], required=True, help='Model type to use')
 	parser.add_argument('--data_type', type=str, choices=['simple', 'dino'], help='Type of dataset to use')
 	parser.add_argument('--wandb_name', type=str, help='WandB run name')
 
@@ -299,7 +299,7 @@ if __name__ == '__main__':
 			latent_dim=config['model']['latent_dim']
 		)
 	elif config['model']['type'] == 'dino':
-		model = AutoencoderDINO(
+		model = AutoencoderDINOCorrespondence(
 			in_channels=3,
 			out_channels=3,
 			z_channels=config['model']['latent_dim'],
@@ -320,8 +320,14 @@ if __name__ == '__main__':
 		vae.to(accelerator.device)
 		vae.eval()
 
-		model = AutoencoderVAE(
+		model = AutoencoderLatentInputs(
 			in_channels=vae.config.latent_channels,
+			z_channels=config['model']['latent_dim']
+		)
+	elif config['model']['type'] == 'v2':
+		model = AutoencoderV2(
+			in_channels=3,
+			out_channels=3,
 			z_channels=config['model']['latent_dim']
 		)
 

@@ -5,7 +5,6 @@ from einops import rearrange
 
 from diffusers.models.autoencoders.vae import Encoder
 
-
 class FiLM2d(nn.Module):
 	def __init__(self, channels: int, cond_dim: int):
 		super().__init__()
@@ -160,7 +159,7 @@ class UNet2DConditionModel(nn.Module):
 
 		self.conv_out = nn.Sequential(
 			nn.ConvTranspose2d(block_out_channels[0], block_out_channels[0], kernel_size=2, stride=2),
-			
+
 			nn.GroupNorm(min(32, block_out_channels[0]), block_out_channels[0]),
 			nn.SiLU(),
 			nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
@@ -183,38 +182,3 @@ class UNet2DConditionModel(nn.Module):
 		if return_dict:
 			return {"sample": x}
 		return (x,)
-
-
-class Autoencoder(nn.Module):
-	def __init__(self, in_channels=3, out_channels=3, z_channels=128):
-		super().__init__()
-		self.encoder = Encoder(
-			in_channels=in_channels,
-			out_channels=z_channels,
-			down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-			block_out_channels=(64, 128, 256),
-			layers_per_block=1,
-			act_fn='silu',
-			double_z=False,
-			norm_num_groups=32,
-			mid_block_add_attention=False,
-		)
-
-		self.global_pool = nn.AdaptiveAvgPool1d(1)
-
-		self.decoder = UNet2DConditionModel(
-			in_channels=in_channels,
-			out_channels=out_channels,
-			cond_dim=z_channels,
-			block_out_channels=(64, 128, 256, 512),
-			layers_per_block=1
-		)
-
-	def forward(self, x1, x2):
-		z_diff = self.encoder(x2 - x1)  # [B, z_channels, H', W']
-		z_diff = z_diff.view(z_diff.size(0), z_diff.size(1), -1)  # [B, z_channels, N]
-		z_diff = self.global_pool(z_diff).squeeze(-1)  # [B, z_channels]
-
-		# Decode using UNet2D
-		recon = self.decoder(sample=x1, cond=z_diff, return_dict=False)[0]
-		return recon

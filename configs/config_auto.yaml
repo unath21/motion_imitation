@@ -20,7 +20,7 @@ model:
   type: "masked_inputs"  # Options: "autoencoder", "dino"
   image_size: 256
   patch_size: 16
-  latent_dim: 64
+  latent_dim: 1
 
 # Training parameters
 train:
