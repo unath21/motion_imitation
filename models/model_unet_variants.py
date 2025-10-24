@@ -175,6 +175,9 @@ class UNet2DConditionModel(nn.Module):
 			x = down_block(x, cond)
 			skips.append(x)
 
+		for skip in skips:
+			print(skip.shape)
+
 		for idx, up_block in enumerate(self.up_blocks):
 			skip = skips.pop() if len(skips) > 0 else None
 			x = up_block(x, skip=skip, cond=cond)
@@ -268,3 +271,74 @@ class AutoencoderDINO(nn.Module):
 		# Decode using UNet2D
 		recon = self.decoder(sample=x1, cond=z_diff, return_dict=False)[0]
 		return recon
+
+
+class AutoencoderMaskedInputs(nn.Module):
+	def __init__(self, in_channels=3, out_channels=3, z_channels=128):
+		super().__init__()
+		self.encoder = Encoder(
+			in_channels=in_channels,
+			out_channels=z_channels,
+			down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+			block_out_channels=(64, 128, 256),
+			layers_per_block=1,
+			act_fn='silu',
+			double_z=False,
+			norm_num_groups=32,
+			mid_block_add_attention=False,
+		)
+
+		self.global_pool = nn.AdaptiveAvgPool1d(1)
+
+		self.decoder = UNet2DConditionModel(
+			in_channels=in_channels,
+			out_channels=out_channels,
+			cond_dim=z_channels,
+			block_out_channels=(64, 128, 256, 512),
+			layers_per_block=1
+		)
+
+	def forward(self, x1, x2, masked_x1):
+		img_diff = x2 - x1
+		z_diff = self.encoder(img_diff)  # [B, z_channels, H', W']
+		z_diff = z_diff.view(z_diff.size(0), z_diff.size(1), -1)  # [B, z_channels, N]
+		z_diff = self.global_pool(z_diff).squeeze(-1)  # [B, z_channels]
+
+		# Decode using UNet2D
+		recon = self.decoder(sample=masked_x1, cond=z_diff, return_dict=False)[0]
+		return recon
+
+class AutoencoderVAE(nn.Module):
+	def __init__(self, in_channels=3, z_channels=128):
+		super().__init__()
+		self.encoder = Encoder(
+			in_channels=in_channels,
+			out_channels=z_channels,
+			down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+			block_out_channels=(64, 128, 256),
+			layers_per_block=1,
+			act_fn='silu',
+			double_z=False,
+			norm_num_groups=32,
+			mid_block_add_attention=False,
+		)
+
+		self.global_pool = nn.AdaptiveAvgPool1d(1)
+
+		self.decoder = UNet2DConditionModel(
+			in_channels=in_channels,
+			out_channels=in_channels,
+			cond_dim=z_channels,
+			block_out_channels=(64, 128, 256, 512),
+			layers_per_block=1
+		)
+
+	def forward(self, x1, x2):
+		img_diff = x2 - x1
+		z_diff = self.encoder(img_diff)                    # [B, z_channels, H', W']
+		z_diff = z_diff.view(z_diff.size(0), z_diff.size(1), -1)  # [B, z_channels, N]
+		z_diff = self.global_pool(z_diff).squeeze(-1)  # [B, z_channels]
+
+		# --- Decode latent diff using conditional UNet ---
+		recon_latent = self.decoder(sample=x1, cond=z_diff, return_dict=False)[0]
+		return recon_latent

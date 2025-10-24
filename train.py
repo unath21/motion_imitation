@@ -14,7 +14,8 @@ import torch.nn.functional as F
 from models import *
 from utils import setup_seed
 from simple_pair_dataset import SimplePairDataset
-
+from diffusers import AutoencoderKL
+import torch.profiler as profiler
 
 def load_config(config_path):
 	"""Load configuration from YAML file."""
@@ -128,7 +129,7 @@ if __name__ == '__main__':
 					   help='Path to checkpoint to resume from')
 	parser.add_argument('--save_dir', type=str, required=True)
 	parser.add_argument('--dino_correspondence', action='store_true', default=False, help='Enable dual guidance with DINO features and image subtraction')
-	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'dino'], required=True, help='Model type to use')
+	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'dino', 'masked_inputs', 'vae'], required=True, help='Model type to use')
 	parser.add_argument('--data_type', type=str, choices=['simple', 'dino'], help='Type of dataset to use')
 	parser.add_argument('--wandb_name', type=str, help='WandB run name')
 
@@ -235,7 +236,8 @@ if __name__ == '__main__':
 			root=config['data']['root'],
 			pairs_path=config['data']['train_pairs_json'],
 			frame_size=config['data']['frame_size'],
-			split='train'
+			split='train',
+			normalization='imagenet' if config['model']['type'] != 'vae' else 'default',
 		)
 
 		# For validation, we can use a subset or create separate pairs
@@ -243,7 +245,8 @@ if __name__ == '__main__':
 			root=config['data']['root'],
 			pairs_path=config['data']['val_pairs_json'],
 			frame_size=config['data']['frame_size'],
-			split='val'  # Different split for different augmentations
+			split='val',
+			normalization='imagenet' if config['model']['type'] != 'vae' else 'default',
 		)
 	elif config['data']['type'] == 'dino':
 		from simple_pair_dino_dataset import SimplePairDINODataset
@@ -272,7 +275,8 @@ if __name__ == '__main__':
 		batch_size=config['validation']['num_samples_to_log'],
 		shuffle=False,
 		num_workers=config['data']['num_workers'],
-		pin_memory=True
+		pin_memory=True,
+		persistent_workers=True
 	)))
 
 
@@ -301,7 +305,26 @@ if __name__ == '__main__':
 			z_channels=config['model']['latent_dim'],
 			dino_correspondence=config['model']['dino_correspondence']
 		)
-	
+	elif config['model']['type'] == 'masked_inputs':
+		model = AutoencoderMaskedInputs(
+			in_channels=3,
+			out_channels=3,
+			z_channels=config['model']['latent_dim']
+		)
+	elif config['model']['type'] == 'vae':
+		vae = AutoencoderKL.from_pretrained(
+			"stabilityai/stable-diffusion-3.5-large",
+			subfolder="vae",
+			torch_dtype=torch.bfloat16
+		)
+		vae.to(accelerator.device)
+		vae.eval()
+
+		model = AutoencoderVAE(
+			in_channels=vae.config.latent_channels,
+			z_channels=config['model']['latent_dim']
+		)
+
 	model = torch.compile(model, mode='reduce-overhead', fullgraph=False)
 
 	if accelerator.is_main_process:
@@ -346,13 +369,33 @@ if __name__ == '__main__':
 				dino1 = batch['dino1']  # DINO features for img1
 				dino2 = batch['dino2']  # DINO features for img2
 
+			if config['model']['type'] == 'masked_inputs':
+				masked_img1 = batch['masked_img1']  # Masked first image
+				masked_img2 = batch['masked_img2']  # Masked second image
+
 			# Use accelerate's autocast and gradient accumulation
 			with accelerator.autocast():
 				if config['data']['type'] == 'dino':
 					predicted_img2 = model(img1, img2, dino1, dino2)
+					loss = torch.mean((predicted_img2 - img2) ** 2)
 				else:
-					predicted_img2 = model(img1, img2)
-				loss = torch.mean((predicted_img2 - img2) ** 2)
+					if config['model']['type'] == 'masked_inputs':
+						predicted_img2 = model(img1, img2, masked_img1)
+						loss = torch.mean((predicted_img2 - masked_img2) ** 2)
+					elif config['model']['type'] == 'vae':
+						# start = time.time()
+						batch_imgs = torch.cat([img1, img2], dim=0)  # [2*B, C, H, W]
+						with torch.no_grad():
+							batch_latents = vae.encode(batch_imgs).latent_dist.sample()
+						# print(f"VAE encoding time: {time.time() - start:.4f} seconds")
+						x1, x2 = batch_latents.chunk(2, dim=0)
+						# start = time.time()
+						x2_pred = model(x1, x2)
+						loss = torch.mean((x2_pred - x2) ** 2)
+						# print(f"Model forward time: {time.time() - start:.4f} seconds")
+					else:
+						predicted_img2 = model(img1, img2)
+						loss = torch.mean((predicted_img2 - img2) ** 2)
 
 			accelerator.backward(loss)
 
@@ -381,12 +424,28 @@ if __name__ == '__main__':
 					val_dino1 = val_batch['dino1']
 					val_dino2 = val_batch['dino2']
 
+				if config['model']['type'] == 'masked_inputs':
+					val_masked_img1 = val_batch['masked_img1']
+					val_masked_img2 = val_batch['masked_img2']
+
 				with accelerator.autocast():
 					if config['data']['type'] == 'dino':
 						predicted_val_img2 = model(val_img1, val_img2, val_dino1, val_dino2)
+						val_loss = torch.mean((predicted_val_img2 - val_img2) ** 2)
 					else:
-						predicted_val_img2 = model(val_img1, val_img2)
-					val_loss = torch.mean((predicted_val_img2 - val_img2) ** 2)
+						if config['model']['type'] == 'masked_inputs':
+							predicted_val_img2 = model(val_img1, val_img2, val_masked_img1)
+							val_loss = torch.mean((predicted_val_img2 - val_masked_img2) ** 2)
+						elif config['model']['type'] == 'vae':
+							batch_imgs = torch.cat([val_img1, val_img2], dim=0)  # [2*B, C, H, W]
+							with torch.no_grad():
+								batch_latents = vae.encode(batch_imgs).latent_dist.sample()
+							x1, x2 = batch_latents.chunk(2, dim=0)
+							x2_pred = model(x1, x2)
+							val_loss = torch.mean((x2_pred - x2) ** 2)
+						else:
+							predicted_val_img2 = model(val_img1, val_img2)
+							val_loss = torch.mean((predicted_val_img2 - val_img2) ** 2)
 
 				# Gather validation loss for logging
 				val_loss_gathered = accelerator.gather_for_metrics(val_loss)
@@ -424,19 +483,36 @@ if __name__ == '__main__':
 						train_dino1 = train_batch['dino1'][:config['validation']['num_samples_to_log']]
 						train_dino2 = train_batch['dino2'][:config['validation']['num_samples_to_log']]
 
+					if config['model']['type'] == 'masked_inputs':
+						train_masked_img1 = train_batch['masked_img1'][:config['validation']['num_samples_to_log']]
+						train_masked_img2 = train_batch['masked_img2'][:config['validation']['num_samples_to_log']]
+
 					model.eval()
 					with torch.no_grad():
 						with accelerator.autocast():
 							if config['data']['type'] == 'dino':
 								predicted_train_img2 = model(train_img1, train_img2, train_dino1, train_dino2)
 							else:
-								predicted_train_img2 = model(train_img1, train_img2)
+								if config['model']['type'] == 'masked_inputs':
+									predicted_train_img2 = model(train_img1, train_img2, train_masked_img1)
+								elif config['model']['type'] == 'vae':
+									batch_imgs = torch.cat([train_img1, train_img2], dim=0).to(vae.device).to(dtype=torch.bfloat16)  # [2*B, C, H, W]
+									batch_latents = vae.encode(batch_imgs).latent_dist.sample()
+									x1, x2 = batch_latents.chunk(2, dim=0)
+									x2_pred = model(x1, x2)
+									predicted_train_img2 = vae.decode(x2_pred, return_dict=False)[0]
+								else:
+									predicted_train_img2 = model(train_img1, train_img2)
 					model.train()
 
 					# Denormalize for visualization
 					def denormalize(tensor):
-						mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
-						std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
+						if config['model']['type'] == 'vae':
+							mean = 0.5
+							std = 0.5
+						else:
+							mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
+							std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
 						return torch.clamp(tensor * std + mean, 0, 1)
 
 					train_img1_vis = denormalize(train_img1)
@@ -469,18 +545,35 @@ if __name__ == '__main__':
 					val_dino1 = val_batch['dino1'][:config['validation']['num_samples_to_log']]
 					val_dino2 = val_batch['dino2'][:config['validation']['num_samples_to_log']]
 
+				if config['model']['type'] == 'masked_inputs':
+					val_masked_img1 = val_batch['masked_img1'][:config['validation']['num_samples_to_log']]
+					val_masked_img2 = val_batch['masked_img2'][:config['validation']['num_samples_to_log']]
+
 				with accelerator.autocast():
 					if config['data']['type'] == 'dino':
 						predicted_val_img2 = model(val_img1, val_img2, val_dino1, val_dino2)
 					else:
-						predicted_val_img2 = model(val_img1, val_img2)
+						if config['model']['type'] == 'masked_inputs':
+							predicted_val_img2 = model(val_img1, val_img2, val_masked_img1)
+						elif config['model']['type'] == 'vae':
+							batch_imgs = torch.cat([val_img1, val_img2], dim=0)  # [2*B, C, H, W]
+							batch_latents = vae.encode(batch_imgs).latent_dist.sample()
+							x1, x2 = batch_latents.chunk(2, dim=0)
+							x2_pred = model(x1, x2)
+							predicted_val_img2 = vae.decode(x2_pred, return_dict=False)[0]
+						else:
+							predicted_val_img2 = model(val_img1, val_img2)
 
 				# Only visualize from main process
 				if accelerator.is_main_process and writer is not None:
 					# Denormalize for visualization
 					def denormalize(tensor):
-						mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
-						std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
+						if config['model']['type'] == 'vae':
+							mean = 0.5
+							std = 0.5
+						else:
+							mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
+							std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
 						return torch.clamp(tensor * std + mean, 0, 1)
 
 					val_img1_vis = denormalize(val_img1)
@@ -502,11 +595,11 @@ if __name__ == '__main__':
 			if e == config['total_epoch'] - 1:
 				# Final save - just the model like your original code
 				unwrapped_model = accelerator.unwrap_model(model)
-				torch.save(unwrapped_model, config['logging']['model_save_path'])
+				torch.save(unwrapped_model, os.path.join(config['logging']['model_save_path'], "final_model.pt"))
 				print(f"Final model saved to: {config['logging']['model_save_path']}")
 			else:
 				# Intermediate save - full checkpoint
-				checkpoint_dir = os.path.dirname(config['logging']['model_save_path'])
+				checkpoint_dir = config['logging']['model_save_path']
 				checkpoint_filename = f"checkpoint_epoch_{e}.pt"
 				checkpoint_save_path = os.path.join(checkpoint_dir, checkpoint_filename)
 				save_checkpoint(accelerator, model, optim, e, avg_train_loss, checkpoint_save_path)

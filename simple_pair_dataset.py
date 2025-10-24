@@ -24,6 +24,7 @@ class SimplePairDataset(Dataset):
         frame_size: int = 224,
         split: str = 'train',
         seed: int = 42,
+        normalization: str = 'imagenet',
     ):
         """
         Args:
@@ -37,9 +38,11 @@ class SimplePairDataset(Dataset):
         assert os.path.isdir(root), f"Root not found: {root}"
         self.root = root
         self.frames_dir = os.path.join(root, "frames")
+        self.masked_frames_dir = os.path.join(root, "masked_frames")
         self.frame_size = frame_size
         self.split = split
         self.rng = random.Random(seed)
+        self.normalization = normalization
         
         # Load pairs
         if not os.path.isfile(pairs_path):
@@ -90,6 +93,18 @@ class SimplePairDataset(Dataset):
             raise FileNotFoundError(f"Failed to read frame: {path}")
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return img
+    
+    def _load_masked_frame(self, video_id: str, frame_file: str):
+        name, ext = os.path.splitext(frame_file)
+        frame_num = int(name) - 1
+
+        frame_file = f"{frame_num:06d}{ext}"  # zero-padded to 6 digits
+        path = os.path.join(self.masked_frames_dir, video_id, frame_file)
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"Failed to read frame: {path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
 
     def _resize_and_crop(self, img):
         """Resize and crop image to target size"""
@@ -115,29 +130,29 @@ class SimplePairDataset(Dataset):
         cropped = img[y:y+self.frame_size, x:x+self.frame_size]
         return cropped
 
-    def _apply_augmentations(self, img1, img2):
+    def _apply_augmentations(self, *images):
         """Apply simple augmentations for training"""
-        if self.split != 'train':
-            return img1, img2
-        
-        # Horizontal flip (same for both images)
+        if self.split != 'train' or not images:
+            return images
+
+        augmented = list(images)
+
+        # --- Horizontal flip (same for all images) ---
         if self.rng.random() < 0.5:
-            img1 = cv2.flip(img1, 1)
-            img2 = cv2.flip(img2, 1)
-        
-        # Simple color jitter (same for both to maintain consistency)
+            augmented = [cv2.flip(img, 1) for img in augmented]
+
+        # --- Simple color jitter (same alpha/beta for all) ---
         if self.rng.random() < 0.3:
             alpha = 1.0 + self.rng.uniform(-0.1, 0.1)  # contrast
             beta = self.rng.uniform(-0.05, 0.05) * 255  # brightness
-            
+
             def apply_jitter(img):
                 out = img.astype('float32') * alpha + beta
                 return out.clip(0, 255).astype('uint8')
-            
-            img1 = apply_jitter(img1)
-            img2 = apply_jitter(img2)
-        
-        return img1, img2
+
+            augmented = [apply_jitter(img) for img in augmented]
+
+        return tuple(augmented)
 
     def _to_tensor(self, img):
         """Convert numpy image to tensor with ImageNet normalization"""
@@ -147,11 +162,12 @@ class SimplePairDataset(Dataset):
         # Convert to tensor (C, H, W)
         tensor = torch.from_numpy(img).permute(2, 0, 1)
         
-        # Apply ImageNet normalization
-        # ImageNet mean: [0.485, 0.456, 0.406] for RGB
-        # ImageNet std: [0.229, 0.224, 0.225] for RGB
-        mean = torch.tensor([0.485, 0.456, 0.406], dtype=tensor.dtype, device=tensor.device)
-        std = torch.tensor([0.229, 0.224, 0.225], dtype=tensor.dtype, device=tensor.device)
+        if self.normalization != 'imagenet':
+            mean = torch.tensor([0.5, 0.5, 0.5], dtype=tensor.dtype, device=tensor.device)
+            std = torch.tensor([0.5, 0.5, 0.5], dtype=tensor.dtype, device=tensor.device)
+        else:
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=tensor.dtype, device=tensor.device)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=tensor.dtype, device=tensor.device)
         
         # Normalize: (x - mean) / std
         tensor = (tensor - mean.view(3, 1, 1)) / std.view(3, 1, 1)
@@ -176,7 +192,10 @@ class SimplePairDataset(Dataset):
         f2 = frames[i2]
         img1 = self._load_frame(vid, f1)
         img2 = self._load_frame(vid, f2)
-        
+        # Load masked frames
+        masked_img1 = self._load_masked_frame(vid, f1)
+        masked_img2 = self._load_masked_frame(vid, f2)
+
         # Process images with same crop region to maintain spatial consistency
         h1, w1 = img1.shape[:2]
         h2, w2 = img2.shape[:2]
@@ -191,6 +210,8 @@ class SimplePairDataset(Dataset):
         nh2, nw2 = int(round(h2 * scale2)), int(round(w2 * scale2))
         img1 = cv2.resize(img1, (nw1, nh1), interpolation=cv2.INTER_LINEAR)
         img2 = cv2.resize(img2, (nw2, nh2), interpolation=cv2.INTER_LINEAR)
+        masked_img1 = cv2.resize(masked_img1, (nw1, nh1), interpolation=cv2.INTER_LINEAR)
+        masked_img2 = cv2.resize(masked_img2, (nw2, nh2), interpolation=cv2.INTER_LINEAR)
         
         # Apply same crop coordinates (use img1's dimensions as reference)
         h, w = img1.shape[:2]
@@ -203,23 +224,29 @@ class SimplePairDataset(Dataset):
         
         # Crop both images
         img1 = img1[y:y+self.frame_size, x:x+self.frame_size]
+        masked_img1 = masked_img1[y:y+self.frame_size, x:x+self.frame_size]
         
         # For img2, adjust crop coordinates if needed
         h2, w2 = img2.shape[:2]
         y2 = min(y, max(0, h2 - self.frame_size))
         x2 = min(x, max(0, w2 - self.frame_size))
         img2 = img2[y2:y2+self.frame_size, x2:x2+self.frame_size]
+        masked_img2 = masked_img2[y2:y2+self.frame_size, x2:x2+self.frame_size]
         
         # Apply augmentations
-        img1, img2 = self._apply_augmentations(img1, img2)
+        img1, img2, masked_img1, masked_img2 = self._apply_augmentations(img1, img2, masked_img1, masked_img2)
         
         # Convert to tensors
         tensor1 = self._to_tensor(img1)
         tensor2 = self._to_tensor(img2)
-        
+        masked_tensor1 = self._to_tensor(masked_img1)
+        masked_tensor2 = self._to_tensor(masked_img2)
+
         return {
             'img1': tensor1,           # First image
-            'img2': tensor2,           # Second image  
+            'img2': tensor2,           # Second image
+            'masked_img1': masked_tensor1,  # First masked image
+            'masked_img2': masked_tensor2,  # Second masked image
             'video_id': vid,           # Video identifier
             'frame_idx1': int(i1),     # First frame index
             'frame_idx2': int(i2),     # Second frame index

@@ -2,22 +2,22 @@
 
 # General training parameters
 seed: 42
-total_epoch: 2000
+total_epoch: 1000
 warmup_epoch: 5
 
 # Data parameters
 # Data configuration
 data:
   root: "/data/pturaga/datasets/Penn_Action/"  # Path to Penn Action frames directory
-  train_pairs_json: "/home/rgoel15/motion_imitation/data/jsons/train_set.json"  # JSON file with frame pairs for training
-  val_pairs_json: "/home/rgoel15/motion_imitation/data/jsons/val_set.json"      # JSON file with frame pairs for validation
+  train_pairs_json: "/home/rgoel15/motion_imitation/data/train_set.json"  # JSON file with frame pairs for training
+  val_pairs_json: "/home/rgoel15/motion_imitation/data/val_set.json"      # JSON file with frame pairs for validation
   type: "simple"  # Options: "simple", "dino"
   frame_size: 256                       # Size to resize frames to
   num_workers: 32                        # Number of data loading workers
 
 # Model parameters
 model:
-  type: "autoencoder"  # Options: "autoencoder", "dino"
+  type: "masked_inputs"  # Options: "autoencoder", "dino"
   image_size: 256
   patch_size: 16
   latent_dim: 64
@@ -51,6 +51,6 @@ wandb:
 
 # Validation parameters
 validation:
-  log_images_every: 5
+  log_images_every: 50
   num_samples_to_log: 40
   save_model_every: 50  # Save model every N epochs
