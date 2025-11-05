@@ -8,3 +8,5 @@ score_and_rank_pairs.py
 stats.py
 data/generate_dino_features.py
 data/generate_dino_features_ddp.py
+plot*
+*comparison*

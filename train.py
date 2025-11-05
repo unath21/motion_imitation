@@ -1,98 +1,14 @@
 import os
 import argparse
-import math
 import time
 import yaml
 import torch
-import torchvision
 from torch.utils.tensorboard import SummaryWriter
-from torchvision.transforms import ToTensor, Compose, Normalize
 from tqdm import tqdm
-from einops import rearrange
-import torch.nn.functional as F
 
-from models import Autoencoder, AutoencoderDINOCorrespondence, AutoencoderMaskedInputs, AutoencoderLatentInputs, AutoencoderV2, SimpleViT
-from utils import setup_seed
+from models import create_model
+from utils import setup_seed, load_config, load_checkpoint, save_checkpoint
 from simple_pair_dataset import SimplePairDataset
-from diffusers import AutoencoderKL
-import torch.profiler as profiler
-
-def load_config(config_path):
-	"""Load configuration from YAML file."""
-	with open(config_path, 'r') as f:
-		config = yaml.safe_load(f)
-	return config
-
-def save_checkpoint(accelerator, model, optimizer, epoch, loss, checkpoint_path):
-	"""Save training checkpoint, compatible with torch.compile() and Accelerate."""
-	if accelerator.is_main_process:
-		# Unwrap the model (Accelerate handles DDP)
-		unwrapped_model = accelerator.unwrap_model(model)
-
-		# If the model is compiled, get the original module
-		if hasattr(unwrapped_model, '_orig_mod'):
-			unwrapped_model = unwrapped_model._orig_mod
-
-		clean_state_dict = unwrapped_model.state_dict()
-
-		checkpoint = {
-			'epoch': epoch,
-			'model_state_dict': clean_state_dict,  # Save clean state dict
-			'optimizer_state_dict': optimizer.state_dict(),
-			'loss': loss,
-		}
-
-		torch.save(checkpoint, checkpoint_path)
-		print(f"✅ Checkpoint saved (epoch {epoch}) at: {checkpoint_path}")
-
-
-def load_checkpoint(accelerator, model, optimizer, checkpoint_path):
-	"""Load training checkpoint with compatibility for torch.compile() and Accelerate."""
-	if not os.path.exists(checkpoint_path):
-		print(f"⚠️ No checkpoint found at: {checkpoint_path}")
-		return 0, None
-
-	print(f"📂 Loading checkpoint from: {checkpoint_path}")
-	checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-	# Unwrap model for loading
-	unwrapped_model = accelerator.unwrap_model(model)
-	is_compiled_model = hasattr(unwrapped_model, '_orig_mod')
-
-	model_to_load = unwrapped_model._orig_mod if is_compiled_model else unwrapped_model
-	checkpoint_state_dict = checkpoint.get('model_state_dict', checkpoint)
-
-	# Handle potential prefix mismatch for compiled models
-	if is_compiled_model:
-		model_keys = model_to_load.state_dict().keys()
-		has_prefix_in_model = any(k.startswith('_orig_mod.') for k in model_keys)
-		has_prefix_in_ckpt = any(k.startswith('_orig_mod.') for k in checkpoint_state_dict)
-
-		if has_prefix_in_model and not has_prefix_in_ckpt:
-			print("ℹ️ Adding '_orig_mod.' prefix to checkpoint keys for compiled model.")
-			checkpoint_state_dict = {'_orig_mod.' + k: v for k, v in checkpoint_state_dict.items()}
-
-	# Try to load model weights
-	try:
-		model_to_load.load_state_dict(checkpoint_state_dict)
-		print("✅ Model weights loaded successfully.")
-	except Exception as e:
-		print(f"⚠️ Error loading model state_dict: {e}")
-		return 0, None
-
-	# Try to load optimizer
-	if 'optimizer_state_dict' in checkpoint and optimizer is not None:
-		try:
-			optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-			print("✅ Optimizer state loaded successfully.")
-		except Exception as e:
-			print(f"⚠️ Could not load optimizer state: {e}")
-
-	start_epoch = checkpoint.get('epoch', 0) + 1
-	last_loss = checkpoint.get('loss', None)
-	print(f"Resumed from epoch {checkpoint.get('epoch', 0)}, last loss: {last_loss}")
-	return start_epoch, last_loss
-
 
 try:
 	from accelerate import Accelerator
@@ -105,6 +21,29 @@ try:
 	import wandb
 except ImportError:
 	wandb = None
+
+
+def initialize_model(config, accelerator):
+	model_type = config["model"]["type"]
+	latent_dim = config["model"]["latent_dim"]
+
+	model = create_model(
+			name=model_type,
+			in_channels=3,
+			out_channels=3,
+			z_channels=latent_dim,
+			encoder_block_out_channels=(64, 128, 256),
+			decoder_cond_flatten=True if 'v2' in model_type else False,
+			decoder_cond_scale=64 * 64 if 'v2' in model_type else 1,
+		)
+	return model
+
+
+def denormalize(tensor):
+	mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
+	std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
+	return torch.clamp(tensor * std + mean, 0, 1)
+
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='SimpleViT MAE Pretraining')
@@ -128,10 +67,9 @@ if __name__ == '__main__':
 	parser.add_argument('--resume', type=str, default=None,
 					   help='Path to checkpoint to resume from')
 	parser.add_argument('--save_dir', type=str, required=True)
-	parser.add_argument('--dino_correspondence', action='store_true', default=False, help='Enable dual guidance with DINO features and image subtraction')
-	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'dino', 'masked_inputs', 'vae', 'v2'], required=True, help='Model type to use')
-	parser.add_argument('--data_type', type=str, choices=['simple', 'dino'], help='Type of dataset to use')
+	parser.add_argument('--model', type=str, choices=['autoencoder', 'simplevit', 'autoencoder_v2'], required=True, help='Model type to use')
 	parser.add_argument('--wandb_name', type=str, help='WandB run name')
+	parser.add_argument('--latent_dim', type=int, required=True, help='Latent dimension size for the model')
 
 	args = parser.parse_args()
 
@@ -167,14 +105,12 @@ if __name__ == '__main__':
 	if args.save_dir is not None:
 		config['logging']['model_save_path'] = args.save_dir
 		os.makedirs(args.save_dir, exist_ok=True)
-	if args.dino_correspondence is not None:
-		config['model']['dino_correspondence'] = args.dino_correspondence
 	if args.model is not None:
 		config['model']['type'] = args.model
-	if args.data_type is not None:
-		config['data']['type'] = args.data_type
 	if args.wandb_name is not None:
 		config['wandb']['run_name'] = args.wandb_name
+	if args.latent_dim is not None:
+		config['model']['latent_dim'] = args.latent_dim
 
 	print(f"Loaded config from: {args.config}")
 
@@ -230,41 +166,23 @@ if __name__ == '__main__':
 		print(f"Per-device batch size: {load_batch_size}")
 		print(f"Effective batch size: {effective_batch_size}")
 
-	if config['data']['type'] == 'simple':
-		# Create SimplePairDataset for training
-		train_dataset = SimplePairDataset(
-			root=config['data']['root'],
-			pairs_path=config['data']['train_pairs_json'],
-			frame_size=config['data']['frame_size'],
-			split='train',
-			normalization='imagenet' if config['model']['type'] != 'vae' else 'default',
-		)
+	# Create SimplePairDataset for training
+	train_dataset = SimplePairDataset(
+		root=config['data']['root'],
+		pairs_path=config['data']['train_pairs_json'],
+		frame_size=config['data']['frame_size'],
+		split='train',
+		normalization='default' if "latent_inputs" in config['model']['type'] else 'imagenet',
+	)
 
-		# For validation, we can use a subset or create separate pairs
-		val_dataset = SimplePairDataset(
-			root=config['data']['root'],
-			pairs_path=config['data']['val_pairs_json'],
-			frame_size=config['data']['frame_size'],
-			split='val',
-			normalization='imagenet' if config['model']['type'] != 'vae' else 'default',
-		)
-	elif config['data']['type'] == 'dino':
-		from simple_pair_dino_dataset import SimplePairDINODataset
-		# Create SimplePairDINODataset for training
-		train_dataset = SimplePairDINODataset(
-			root=config['data']['root'],
-			pairs_path=config['data']['train_pairs_json'],
-			frame_size=config['data']['frame_size'],
-			split='train'
-		)
-
-		# For validation, we can use a subset or create separate pairs
-		val_dataset = SimplePairDINODataset(
-			root=config['data']['root'],
-			pairs_path=config['data']['val_pairs_json'],
-			frame_size=config['data']['frame_size'],
-			split='val'  # Different split for different augmentations
-		)
+	# For validation, we can use a subset or create separate pairs
+	val_dataset = SimplePairDataset(
+		root=config['data']['root'],
+		pairs_path=config['data']['val_pairs_json'],
+		frame_size=config['data']['frame_size'],
+		split='val',
+		normalization='default' if "latent_inputs" in config['model']['type'] else 'imagenet',
+	)
 
 	dataloader = torch.utils.data.DataLoader(train_dataset, load_batch_size, shuffle=True, num_workers=config['data']['num_workers'], pin_memory=True, persistent_workers=True)
 	val_dataloader = torch.utils.data.DataLoader(val_dataset, load_batch_size, shuffle=False, num_workers=config['data']['num_workers'], pin_memory=True, persistent_workers=True)
@@ -286,50 +204,7 @@ if __name__ == '__main__':
 	else:
 		writer = None
 
-	if config['model']['type'] == 'autoencoder':
-		model = Autoencoder(
-			in_channels=3,
-			out_channels=3,
-			z_channels=config['model']['latent_dim']
-		)
-	elif config['model']['type'] == 'simplevit':
-		model = SimpleViT(
-			image_size=config['model']['image_size'],
-			patch_size=config['model']['patch_size'],
-			latent_dim=config['model']['latent_dim']
-		)
-	elif config['model']['type'] == 'dino':
-		model = AutoencoderDINOCorrespondence(
-			in_channels=3,
-			out_channels=3,
-			z_channels=config['model']['latent_dim'],
-			dino_correspondence=config['model']['dino_correspondence']
-		)
-	elif config['model']['type'] == 'masked_inputs':
-		model = AutoencoderMaskedInputs(
-			in_channels=3,
-			out_channels=3,
-			z_channels=config['model']['latent_dim']
-		)
-	elif config['model']['type'] == 'vae':
-		vae = AutoencoderKL.from_pretrained(
-			"stabilityai/stable-diffusion-3.5-large",
-			subfolder="vae",
-			torch_dtype=torch.bfloat16
-		)
-		vae.to(accelerator.device)
-		vae.eval()
-
-		model = AutoencoderLatentInputs(
-			in_channels=vae.config.latent_channels,
-			z_channels=config['model']['latent_dim']
-		)
-	elif config['model']['type'] == 'v2':
-		model = AutoencoderV2(
-			in_channels=3,
-			out_channels=3,
-			z_channels=config['model']['latent_dim']
-		)
+	model = initialize_model(config, accelerator)
 
 	model = torch.compile(model, mode='reduce-overhead', fullgraph=False)
 
@@ -346,7 +221,6 @@ if __name__ == '__main__':
 		weight_decay=config['train']['weight_decay']
 	)
 
-	# Prepare model, optimizer, scheduler and dataloaders with accelerate
 	model, optim, dataloader, val_dataloader = accelerator.prepare(
 		model, optim, dataloader, val_dataloader
 	)
@@ -371,37 +245,11 @@ if __name__ == '__main__':
 			step_count += 1
 			img1 = batch['img1']  # First image
 			img2 = batch['img2']  # Second image (target)
-			if config['data']['type'] == 'dino':
-				dino1 = batch['dino1']  # DINO features for img1
-				dino2 = batch['dino2']  # DINO features for img2
-
-			if config['model']['type'] == 'masked_inputs':
-				masked_img1 = batch['masked_img1']  # Masked first image
-				masked_img2 = batch['masked_img2']  # Masked second image
 
 			# Use accelerate's autocast and gradient accumulation
 			with accelerator.autocast():
-				if config['data']['type'] == 'dino':
-					predicted_img2 = model(img1, img2, dino1, dino2)
-					loss = torch.mean((predicted_img2 - img2) ** 2)
-				else:
-					if config['model']['type'] == 'masked_inputs':
-						predicted_img2 = model(img1, img2, masked_img1)
-						loss = torch.mean((predicted_img2 - masked_img2) ** 2)
-					elif config['model']['type'] == 'vae':
-						# start = time.time()
-						batch_imgs = torch.cat([img1, img2], dim=0)  # [2*B, C, H, W]
-						with torch.no_grad():
-							batch_latents = vae.encode(batch_imgs).latent_dist.sample()
-						# print(f"VAE encoding time: {time.time() - start:.4f} seconds")
-						x1, x2 = batch_latents.chunk(2, dim=0)
-						# start = time.time()
-						x2_pred = model(x1, x2)
-						loss = torch.mean((x2_pred - x2) ** 2)
-						# print(f"Model forward time: {time.time() - start:.4f} seconds")
-					else:
-						predicted_img2 = model(img1, img2)
-						loss = torch.mean((predicted_img2 - img2) ** 2)
+				predicted_img2, _ = model(img1, img2)
+				loss = torch.mean((predicted_img2 - img2) ** 2)
 
 			accelerator.backward(loss)
 
@@ -426,32 +274,10 @@ if __name__ == '__main__':
 			for val_batch in tqdm(iter(val_dataloader), disable=not accelerator.is_main_process, desc="Validation"):
 				val_img1 = val_batch['img1']
 				val_img2 = val_batch['img2']
-				if config['data']['type'] == 'dino':
-					val_dino1 = val_batch['dino1']
-					val_dino2 = val_batch['dino2']
-
-				if config['model']['type'] == 'masked_inputs':
-					val_masked_img1 = val_batch['masked_img1']
-					val_masked_img2 = val_batch['masked_img2']
 
 				with accelerator.autocast():
-					if config['data']['type'] == 'dino':
-						predicted_val_img2 = model(val_img1, val_img2, val_dino1, val_dino2)
-						val_loss = torch.mean((predicted_val_img2 - val_img2) ** 2)
-					else:
-						if config['model']['type'] == 'masked_inputs':
-							predicted_val_img2 = model(val_img1, val_img2, val_masked_img1)
-							val_loss = torch.mean((predicted_val_img2 - val_masked_img2) ** 2)
-						elif config['model']['type'] == 'vae':
-							batch_imgs = torch.cat([val_img1, val_img2], dim=0)  # [2*B, C, H, W]
-							with torch.no_grad():
-								batch_latents = vae.encode(batch_imgs).latent_dist.sample()
-							x1, x2 = batch_latents.chunk(2, dim=0)
-							x2_pred = model(x1, x2)
-							val_loss = torch.mean((x2_pred - x2) ** 2)
-						else:
-							predicted_val_img2 = model(val_img1, val_img2)
-							val_loss = torch.mean((predicted_val_img2 - val_img2) ** 2)
+					predicted_val_img2, _ = model(val_img1, val_img2)
+					val_loss = torch.mean((predicted_val_img2 - val_img2) ** 2)
 
 				# Gather validation loss for logging
 				val_loss_gathered = accelerator.gather_for_metrics(val_loss)
@@ -480,46 +306,16 @@ if __name__ == '__main__':
 				# Log training images periodically
 				if e % config['validation']['log_images_every'] == 0:
 					# Get a batch for training visualization
-					# train_batch = next(iter(dataloader))
 					train_batch = fixed_train_batch
 					train_img1 = train_batch['img1'][:config['validation']['num_samples_to_log']]
 					train_img2 = train_batch['img2'][:config['validation']['num_samples_to_log']]
 					train_delta = train_batch['delta'][:config['validation']['num_samples_to_log']]
-					if config['data']['type'] == 'dino':
-						train_dino1 = train_batch['dino1'][:config['validation']['num_samples_to_log']]
-						train_dino2 = train_batch['dino2'][:config['validation']['num_samples_to_log']]
-
-					if config['model']['type'] == 'masked_inputs':
-						train_masked_img1 = train_batch['masked_img1'][:config['validation']['num_samples_to_log']]
-						train_masked_img2 = train_batch['masked_img2'][:config['validation']['num_samples_to_log']]
 
 					model.eval()
 					with torch.no_grad():
 						with accelerator.autocast():
-							if config['data']['type'] == 'dino':
-								predicted_train_img2 = model(train_img1, train_img2, train_dino1, train_dino2)
-							else:
-								if config['model']['type'] == 'masked_inputs':
-									predicted_train_img2 = model(train_img1, train_img2, train_masked_img1)
-								elif config['model']['type'] == 'vae':
-									batch_imgs = torch.cat([train_img1, train_img2], dim=0).to(vae.device).to(dtype=torch.bfloat16)  # [2*B, C, H, W]
-									batch_latents = vae.encode(batch_imgs).latent_dist.sample()
-									x1, x2 = batch_latents.chunk(2, dim=0)
-									x2_pred = model(x1, x2)
-									predicted_train_img2 = vae.decode(x2_pred, return_dict=False)[0]
-								else:
-									predicted_train_img2 = model(train_img1, train_img2)
+							predicted_train_img2, _ = model(train_img1, train_img2)
 					model.train()
-
-					# Denormalize for visualization
-					def denormalize(tensor):
-						if config['model']['type'] == 'vae':
-							mean = 0.5
-							std = 0.5
-						else:
-							mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
-							std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
-						return torch.clamp(tensor * std + mean, 0, 1)
 
 					train_img1_vis = denormalize(train_img1)
 					train_img2_vis = denormalize(train_img2)
@@ -527,13 +323,20 @@ if __name__ == '__main__':
 
 					# Create training image rows for WandB
 					train_rows = []
+					train_masked_rows = []
+					train_pred_rows = []
 					B = train_img1_vis.shape[0]
 					for i in range(B):
 						row = torch.cat([train_img1_vis[i].cpu(), predicted_train_vis[i].cpu(), train_img2_vis[i].cpu()], dim=2)
-						row_np = (row.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+						row_np = (row.permute(1, 2, 0).numpy() * 255).astype('uint8')
 						train_rows.append(wandb.Image(row_np, caption=f"Epoch {e} • train sample {i}: Input | Pred | Target • Δ: {train_delta[i].cpu().numpy()}"))
 
-					wandb_log_dict['train/comparisons_list'] = train_rows
+						pred_row = torch.cat([predicted_train_vis[i].cpu()], dim=2)
+						pred_row_np = (pred_row.permute(1, 2, 0).numpy() * 255).astype('uint8')
+						train_pred_rows.append(wandb.Image(pred_row_np, caption=f"Epoch {e} • train sample {i}: Predicted I2"))
+
+					wandb_log_dict['train/comparisons_list/inputs'] = train_rows
+					wandb_log_dict['train/comparisons_list/predictions'] = train_pred_rows
 
 				wandb_run.log(wandb_log_dict, step=e)
 
@@ -547,68 +350,40 @@ if __name__ == '__main__':
 				val_img1 = val_batch['img1'][:config['validation']['num_samples_to_log']]
 				val_img2 = val_batch['img2'][:config['validation']['num_samples_to_log']]
 				val_delta = val_batch['delta'][:config['validation']['num_samples_to_log']]
-				if config['data']['type'] == 'dino':
-					val_dino1 = val_batch['dino1'][:config['validation']['num_samples_to_log']]
-					val_dino2 = val_batch['dino2'][:config['validation']['num_samples_to_log']]
-
-				if config['model']['type'] == 'masked_inputs':
-					val_masked_img1 = val_batch['masked_img1'][:config['validation']['num_samples_to_log']]
-					val_masked_img2 = val_batch['masked_img2'][:config['validation']['num_samples_to_log']]
 
 				with accelerator.autocast():
-					if config['data']['type'] == 'dino':
-						predicted_val_img2 = model(val_img1, val_img2, val_dino1, val_dino2)
-					else:
-						if config['model']['type'] == 'masked_inputs':
-							predicted_val_img2 = model(val_img1, val_img2, val_masked_img1)
-						elif config['model']['type'] == 'vae':
-							batch_imgs = torch.cat([val_img1, val_img2], dim=0)  # [2*B, C, H, W]
-							batch_latents = vae.encode(batch_imgs).latent_dist.sample()
-							x1, x2 = batch_latents.chunk(2, dim=0)
-							x2_pred = model(x1, x2)
-							predicted_val_img2 = vae.decode(x2_pred, return_dict=False)[0]
-						else:
-							predicted_val_img2 = model(val_img1, val_img2)
+					predicted_val_img2, _ = model(val_img1, val_img2)
 
 				# Only visualize from main process
 				if accelerator.is_main_process and writer is not None:
 					# Denormalize for visualization
-					def denormalize(tensor):
-						if config['model']['type'] == 'vae':
-							mean = 0.5
-							std = 0.5
-						else:
-							mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
-							std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
-						return torch.clamp(tensor * std + mean, 0, 1)
-
 					val_img1_vis = denormalize(val_img1)
 					val_img2_vis = denormalize(val_img2)
 					predicted_vis = denormalize(predicted_val_img2)
 
 					if wandb_run is not None:
 						rows = []
+						masked_input_rows = []
+						pred_rows = []
 						B = val_img1_vis.shape[0]
 						for i in range(B):
-							row = torch.cat([val_img1_vis[i], predicted_vis[i], val_img2_vis[i]], dim=2)
-							row_np = (row.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+							row = torch.cat([val_img1_vis[i].cpu(), predicted_vis[i].cpu(), val_img2_vis[i].cpu()], dim=2)
+							row_np = (row.permute(1, 2, 0).numpy() * 255).astype('uint8')
 							rows.append(wandb.Image(row_np, caption=f"Epoch {e} • sample {i}: Input | Pred | Target • Δ: {val_delta[i].cpu().numpy()}"))
 
-						wandb_run.log({'validation/comparisons_list': rows}, step=e)
+							pred_row = torch.cat([predicted_vis[i].cpu()], dim=2)
+							pred_row_np = (pred_row.permute(1, 2, 0).numpy() * 255).astype('uint8')
+							pred_rows.append(wandb.Image(pred_row_np, caption=f"Epoch {e} • val sample {i}: Predicted I2"))
+
+						wandb_run.log({'validation/comparisons_list/inputs': rows}, step=e)
+						wandb_run.log({'validation/comparisons_list/predictions': pred_rows}, step=e)
 
 		# Save checkpoint (only from main process) - Updated to match your original style
 		if accelerator.is_main_process and (e % config['validation']['save_model_every'] == 0 or e == config['total_epoch'] - 1):
-			if e == config['total_epoch'] - 1:
-				# Final save - just the model like your original code
-				unwrapped_model = accelerator.unwrap_model(model)
-				torch.save(unwrapped_model, os.path.join(config['logging']['model_save_path'], "final_model.pt"))
-				print(f"Final model saved to: {config['logging']['model_save_path']}")
-			else:
-				# Intermediate save - full checkpoint
-				checkpoint_dir = config['logging']['model_save_path']
-				checkpoint_filename = f"checkpoint_epoch_{e}.pt"
-				checkpoint_save_path = os.path.join(checkpoint_dir, checkpoint_filename)
-				save_checkpoint(accelerator, model, optim, e, avg_train_loss, checkpoint_save_path)
+			checkpoint_dir = config['logging']['model_save_path']
+			checkpoint_filename = f"checkpoint_epoch_{e}.pt"
+			checkpoint_save_path = os.path.join(checkpoint_dir, checkpoint_filename)
+			save_checkpoint(accelerator, model, optim, e, avg_train_loss, checkpoint_save_path)
 
 	if accelerator.is_main_process:
 		print("Training complete!")

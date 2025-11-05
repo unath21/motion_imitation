@@ -11,7 +11,6 @@ data:
   root: "/data/pturaga/datasets/Penn_Action/"  # Path to Penn Action frames directory
   train_pairs_json: "/home/rgoel15/motion_imitation/data/train_set.json"  # JSON file with frame pairs for training
   val_pairs_json: "/home/rgoel15/motion_imitation/data/val_set.json"      # JSON file with frame pairs for validation
-  type: "simple"  # Options: "simple", "dino"
   frame_size: 256                       # Size to resize frames to
   num_workers: 32                        # Number of data loading workers
 
@@ -20,7 +19,7 @@ model:
   type: "masked_inputs"  # Options: "autoencoder", "dino"
   image_size: 256
   patch_size: 16
-  latent_dim: 1
+  latent_dim: 64
 
 # Training parameters
 train:

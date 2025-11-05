@@ -38,7 +38,6 @@ class SimplePairDataset(Dataset):
         assert os.path.isdir(root), f"Root not found: {root}"
         self.root = root
         self.frames_dir = os.path.join(root, "frames")
-        self.masked_frames_dir = os.path.join(root, "masked_frames")
         self.frame_size = frame_size
         self.split = split
         self.rng = random.Random(seed)
@@ -88,18 +87,6 @@ class SimplePairDataset(Dataset):
     def _load_frame(self, video_id: str, frame_file: str):
         """Load a single frame from disk"""
         path = os.path.join(self.frames_dir, video_id, frame_file)
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"Failed to read frame: {path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img
-    
-    def _load_masked_frame(self, video_id: str, frame_file: str):
-        name, ext = os.path.splitext(frame_file)
-        frame_num = int(name) - 1
-
-        frame_file = f"{frame_num:06d}{ext}"  # zero-padded to 6 digits
-        path = os.path.join(self.masked_frames_dir, video_id, frame_file)
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Failed to read frame: {path}")
@@ -192,9 +179,6 @@ class SimplePairDataset(Dataset):
         f2 = frames[i2]
         img1 = self._load_frame(vid, f1)
         img2 = self._load_frame(vid, f2)
-        # Load masked frames
-        masked_img1 = self._load_masked_frame(vid, f1)
-        masked_img2 = self._load_masked_frame(vid, f2)
 
         # Process images with same crop region to maintain spatial consistency
         h1, w1 = img1.shape[:2]
@@ -210,8 +194,6 @@ class SimplePairDataset(Dataset):
         nh2, nw2 = int(round(h2 * scale2)), int(round(w2 * scale2))
         img1 = cv2.resize(img1, (nw1, nh1), interpolation=cv2.INTER_LINEAR)
         img2 = cv2.resize(img2, (nw2, nh2), interpolation=cv2.INTER_LINEAR)
-        masked_img1 = cv2.resize(masked_img1, (nw1, nh1), interpolation=cv2.INTER_LINEAR)
-        masked_img2 = cv2.resize(masked_img2, (nw2, nh2), interpolation=cv2.INTER_LINEAR)
         
         # Apply same crop coordinates (use img1's dimensions as reference)
         h, w = img1.shape[:2]
@@ -224,29 +206,23 @@ class SimplePairDataset(Dataset):
         
         # Crop both images
         img1 = img1[y:y+self.frame_size, x:x+self.frame_size]
-        masked_img1 = masked_img1[y:y+self.frame_size, x:x+self.frame_size]
         
         # For img2, adjust crop coordinates if needed
         h2, w2 = img2.shape[:2]
         y2 = min(y, max(0, h2 - self.frame_size))
         x2 = min(x, max(0, w2 - self.frame_size))
         img2 = img2[y2:y2+self.frame_size, x2:x2+self.frame_size]
-        masked_img2 = masked_img2[y2:y2+self.frame_size, x2:x2+self.frame_size]
         
         # Apply augmentations
-        img1, img2, masked_img1, masked_img2 = self._apply_augmentations(img1, img2, masked_img1, masked_img2)
+        img1, img2 = self._apply_augmentations(img1, img2)
         
         # Convert to tensors
         tensor1 = self._to_tensor(img1)
         tensor2 = self._to_tensor(img2)
-        masked_tensor1 = self._to_tensor(masked_img1)
-        masked_tensor2 = self._to_tensor(masked_img2)
 
         return {
             'img1': tensor1,           # First image
             'img2': tensor2,           # Second image
-            'masked_img1': masked_tensor1,  # First masked image
-            'masked_img2': masked_tensor2,  # Second masked image
             'video_id': vid,           # Video identifier
             'frame_idx1': int(i1),     # First frame index
             'frame_idx2': int(i2),     # Second frame index
