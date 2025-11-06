@@ -8,4 +8,4 @@ accelerate launch --config_file accelerate_config.yaml train.py --config ./confi
 
 <!-- I2-I1 -->
 
-accelerate launch --config_file accelerate_config.yaml train.py --config ./configs/config_auto.yaml --save_dir /scratch/rgoel15/motion_emitation_data/model_image_difference --model autoencoder --data_type simple --wandb_name image_difference
+accelerate launch --config_file accelerate_config.yaml train.py --config ./configs/config_auto.yaml --save_dir ./ --model autoencoder_v2 --wandb_mode disabled --latent_dim 1

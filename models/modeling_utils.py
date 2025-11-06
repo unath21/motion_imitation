@@ -26,7 +26,7 @@ class FiLM2d(nn.Module):
 		return gamma * x + beta
 
 
-class ResNetBlock2D(nn.Module):
+class ResNetBlock2DConditional(nn.Module):
 	def __init__(self, in_channels, out_channels, cond_dim=None, stride=1):
 		super().__init__()
 		self.in_channels = in_channels
@@ -74,15 +74,15 @@ class ResNetBlock2D(nn.Module):
 		return h + skip
 
 
-class DownBlock2D(nn.Module):
+class DownBlock2DConditional(nn.Module):
 	def __init__(self, in_channels, out_channels, num_layers=2, cond_dim=None):
 		super().__init__()
 
 		layers = []
-		layers.append(ResNetBlock2D(in_channels, out_channels, cond_dim, stride=2))
+		layers.append(ResNetBlock2DConditional(in_channels, out_channels, cond_dim, stride=2))
 
 		for _ in range(num_layers - 1):
-			layers.append(ResNetBlock2D(out_channels, out_channels, cond_dim))
+			layers.append(ResNetBlock2DConditional(out_channels, out_channels, cond_dim))
 
 		self.layers = nn.ModuleList(layers)
 
@@ -92,7 +92,7 @@ class DownBlock2D(nn.Module):
 		return x
 
 
-class UpBlock2D(nn.Module):
+class UpBlock2DConditional(nn.Module):
 	def __init__(self, in_channels, out_channels, num_layers=2, cond_dim=None, skip_channels=None):
 		super().__init__()
 
@@ -103,10 +103,10 @@ class UpBlock2D(nn.Module):
 
 		layers = []
 		first_in = out_channels + skip_channels
-		layers.append(ResNetBlock2D(first_in, out_channels, cond_dim))
+		layers.append(ResNetBlock2DConditional(first_in, out_channels, cond_dim))
 
 		for _ in range(num_layers - 1):
-			layers.append(ResNetBlock2D(out_channels, out_channels, cond_dim))
+			layers.append(ResNetBlock2DConditional(out_channels, out_channels, cond_dim))
 
 		self.layers = nn.ModuleList(layers)
 
@@ -144,7 +144,7 @@ class UNet2DConditionModel(nn.Module):
 		in_ch = block_out_channels[0]
 		for out_ch in block_out_channels:
 			self.down_blocks.append(
-				DownBlock2D(in_ch, out_ch, layers_per_block, cond_dim)
+				DownBlock2DConditional(in_ch, out_ch, layers_per_block, cond_dim)
 			)
 			in_ch = out_ch
 
@@ -153,7 +153,7 @@ class UNet2DConditionModel(nn.Module):
 		in_ch = block_out_channels[-1]
 		for i, out_ch in enumerate(reversed_channels):
 			self.up_blocks.append(
-				UpBlock2D(in_ch, out_ch, layers_per_block, cond_dim, skip_channels=out_ch)
+				UpBlock2DConditional(in_ch, out_ch, layers_per_block, cond_dim, skip_channels=out_ch)
 			)
 			in_ch = out_ch
 
