@@ -182,3 +182,160 @@ class UNet2DConditionModel(nn.Module):
 		if return_dict:
 			return {"sample": x}
 		return (x,)
+
+class ResNetBlock2D(nn.Module):
+	def __init__(self, in_channels, out_channels, stride=1):
+		super().__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+
+		# First conv block
+		self.norm1 = nn.GroupNorm(min(32, in_channels), in_channels)
+		self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3,
+							   stride=stride, padding=1, bias=False)
+
+		# Second conv block
+		self.norm2 = nn.GroupNorm(min(32, out_channels), out_channels)
+		self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+							   stride=1, padding=1, bias=False)
+
+		if stride != 1 or in_channels != out_channels:
+			self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1,
+								  stride=stride, bias=False)
+		else:
+			self.skip = nn.Identity()
+
+		self.activation = nn.SiLU()
+
+	def forward(self, x, cond=None):
+		skip = self.skip(x)
+
+		# First conv
+		h = self.norm1(x)
+		h = self.activation(h)
+		h = self.conv1(h)
+
+		# Second conv
+		h = self.norm2(h)
+		h = self.activation(h)
+		h = self.conv2(h)
+
+		return h + skip
+
+
+class DownBlock2D(nn.Module):
+	def __init__(self, in_channels, out_channels, num_layers=2):
+		super().__init__()
+
+		layers = []
+		layers.append(ResNetBlock2D(in_channels, out_channels, stride=2))
+
+		for _ in range(num_layers - 1):
+			layers.append(ResNetBlock2D(out_channels, out_channels))
+
+		self.layers = nn.ModuleList(layers)
+
+	def forward(self, x, cond=None):
+		for layer in self.layers:
+			x = layer(x, cond)
+		return x
+
+
+class UpBlock2D(nn.Module):
+	def __init__(self, in_channels, out_channels, num_layers=2, skip_channels=None):
+		super().__init__()
+
+		self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
+		if skip_channels is None:
+			skip_channels = out_channels
+
+		layers = []
+		first_in = out_channels + skip_channels
+		layers.append(ResNetBlock2D(first_in, out_channels))
+
+		for _ in range(num_layers - 1):
+			layers.append(ResNetBlock2D(out_channels, out_channels))
+
+		self.layers = nn.ModuleList(layers)
+
+	def forward(self, x, skip=None):
+		# Upsample
+		x = self.upsample(x)
+
+		if skip is not None:
+			dh = skip.shape[2] - x.shape[2]
+			dw = skip.shape[3] - x.shape[3]
+			pad = [dw // 2, dw - dw // 2, dh // 2, dh - dh // 2]
+			if any(p != 0 for p in pad):
+				x = F.pad(x, pad)
+			x = torch.cat([skip, x], dim=1)
+
+		for layer in self.layers:
+			x = layer(x)
+
+		return x
+
+
+class UNet2DModel(nn.Module):
+	def __init__(self, in_channels=3, out_channels=3,
+				 block_out_channels=(64, 128, 256), layers_per_block=2):
+		super().__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+
+		# Initial convolution
+		self.conv_in = nn.Conv2d(in_channels, block_out_channels[0],
+								 kernel_size=3, padding=1)
+
+		self.down_blocks = nn.ModuleList()
+		in_ch = block_out_channels[0]
+		for out_ch in block_out_channels:
+			self.down_blocks.append(
+				DownBlock2D(in_ch, out_ch, layers_per_block)
+			)
+			in_ch = out_ch
+
+		self.conv_out1 = nn.Sequential(
+			nn.ConvTranspose2d(block_out_channels[-1], block_out_channels[-1], kernel_size=2, stride=2),
+
+			nn.GroupNorm(min(32, block_out_channels[-1]), block_out_channels[-1]),
+			nn.SiLU(),
+			nn.Conv2d(block_out_channels[-1], out_channels, kernel_size=3, padding=1)
+		)
+
+		self.up_blocks = nn.ModuleList()
+		reversed_channels = list(reversed(block_out_channels))
+		in_ch = block_out_channels[-1]
+		for i, out_ch in enumerate(reversed_channels):
+			self.up_blocks.append(
+				UpBlock2D(in_ch, out_ch, layers_per_block, skip_channels=out_ch)
+			)
+			in_ch = out_ch
+
+		self.conv_out2 = nn.Sequential(
+			nn.ConvTranspose2d(block_out_channels[0], block_out_channels[0], kernel_size=2, stride=2),
+
+			nn.GroupNorm(min(32, block_out_channels[0]), block_out_channels[0]),
+			nn.SiLU(),
+			nn.Conv2d(block_out_channels[0], out_channels, kernel_size=3, padding=1)
+		)
+
+
+	def forward(self, sample):
+		x = self.conv_in(sample)
+
+		skips = []
+		for down_block in self.down_blocks:
+			x = down_block(x)
+			skips.append(x)
+
+		down = self.conv_out1(x)
+
+		for idx, up_block in enumerate(self.up_blocks):
+			skip = skips.pop() if len(skips) > 0 else None
+			x = up_block(x, skip=skip)
+
+		up = self.conv_out2(x)
+
+		return down, up

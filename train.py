@@ -33,7 +33,6 @@ def initialize_model(config, accelerator):
 			out_channels=3,
 			z_channels=latent_dim,
 			encoder_block_out_channels=(64, 128, 256),
-			decoder_cond_flatten=True if 'v2' in model_type else False,
 			decoder_cond_scale=64 * 64 if 'v2' in model_type else 1,
 		)
 	return model

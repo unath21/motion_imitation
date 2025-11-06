@@ -2,8 +2,9 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+import time
 
-from diffusers.models.autoencoders.vae import Encoder, Decoder
+from models.modeling_utils import UNet2DModel
 
 
 # ============================================================
@@ -49,42 +50,24 @@ class BaseAutoencoder(nn.Module):
         z_channels=64,
         encoder_block_out_channels=(64, 128, 256),
         decoder_block_out_channels=(64, 128, 256, 512),
-        decoder_cond_flatten=False,
         decoder_cond_scale=1,
-        cross_attention_decoder_conditioning=False,
+        decoder_cross_attn_cond=False,
     ):
         super().__init__()
 
-        self.encoder = Encoder(
+        self.encoder = UNet2DModel(
             in_channels=in_channels,
             out_channels=z_channels,
-            down_block_types=("DownEncoderBlock2D",) * len(encoder_block_out_channels),
             block_out_channels=encoder_block_out_channels,
             layers_per_block=1,
-            act_fn="silu",
-            double_z=False,
-            norm_num_groups=32,
-            mid_block_add_attention=False,
         )
 
-        self.identity_decoder = Decoder(
-            in_channels=z_channels,
-            out_channels=z_channels,
-            up_block_types=("UpDecoderBlock2D",) * len(encoder_block_out_channels),
-            block_out_channels=encoder_block_out_channels[::-1],
-            layers_per_block=1,
-            act_fn="silu",
-            norm_num_groups=32,
-            mid_block_add_attention=False,
-        )
-
-
-        self.downsample = nn.AvgPool2d(kernel_size=4, stride=4)
-        self.decoder_cond_flatten = decoder_cond_flatten
         self.decoder_cond_scale = decoder_cond_scale
-        self.cross_attention_decoder_conditioning = cross_attention_decoder_conditioning
+        self.decoder_cross_attn_cond = decoder_cross_attn_cond
+        downsample_factor = int(256 / decoder_cond_scale ** 0.5)
+        self.downsample = nn.AvgPool2d(kernel_size=downsample_factor, stride=downsample_factor)
 
-        if not self.cross_attention_decoder_conditioning:
+        if not self.decoder_cross_attn_cond:
             from models.modeling_utils import UNet2DConditionModel
             cond_dim = z_channels * decoder_cond_scale
             self.decoder = UNet2DConditionModel(
@@ -105,16 +88,11 @@ class BaseAutoencoder(nn.Module):
             )
 
     def encode(self, x):
-        motion_z = self.encoder(x)
-        identity_z = self.identity_decoder(motion_z)
-        # print(identity_z.shape, motion_z.shape)
-        identity_z = torch.nn.functional.softmax(identity_z, dim=1)
-        # print("After softmax:", identity_z.shape)
-        identity_z = self.downsample(identity_z)
-        # print("After downsample:", identity_z.shape)
-        z = torch.sum(motion_z * identity_z, dim=1)
-        # print("After weighted sum:", z.shape)
-        if self.cross_attention_decoder_conditioning:
+        z1, z2 = self.encoder(x)
+        z2 = torch.nn.functional.softmax(z2, dim=1)
+        z2 = self.downsample(z2)
+        z = torch.sum(z1 * z2, dim=1)
+        if self.decoder_cross_attn_cond:
             return z
         return z.flatten(1)
 
@@ -138,6 +116,5 @@ class Autoencoder(BaseAutoencoder):
 class AutoencoderV2(BaseAutoencoder):
     def forward(self, x1, x2):
         z_diff = self.encode(x2 - x1)
-        # print("After encoding:", z_diff.shape)
         recon = self.decode(x1, z_diff)
         return recon, z_diff
