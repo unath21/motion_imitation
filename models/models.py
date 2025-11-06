@@ -73,31 +73,30 @@ class BaseAutoencoder(nn.Module):
             self.decoder = UNet2DConditionModel(
                 in_channels=in_channels,
                 out_channels=out_channels,
-                cond_dim=cond_dim,
+                k_channels=cond_dim,
                 block_out_channels=decoder_block_out_channels,
                 layers_per_block=1,
             )
         else:
-            from diffusers.models.unet_2d_condition import UNet2DConditionModel
-            self.decoder = UNet2DConditionModel(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                cross_attention_dim=z_channels,
-                block_out_channels=decoder_block_out_channels,
-                layers_per_block=1,
-            )
+            pass
+            # from diffusers.models.unet_2d_condition import UNet2DConditionModel
+            # self.decoder = UNet2DConditionModel(
+            #     in_channels=in_channels,
+            #     out_channels=out_channels,
+            #     cross_attention_dim=z_channels,
+            #     block_out_channels=decoder_block_out_channels,
+            #     layers_per_block=1,
+            # )
 
     def encode(self, x):
         z1, z2 = self.encoder(x)
         z2 = torch.nn.functional.softmax(z2, dim=1)
-        z2 = self.downsample(z2)
-        z = torch.sum(z1 * z2, dim=1)
-        if self.decoder_cross_attn_cond:
-            return z
-        return z.flatten(1)
+        # z2 = self.downsample(z2)
+        # z = torch.sum(z1 * z2, dim=1)
+        return z1, z2
 
-    def decode(self, sample, cond):
-        return self.decoder(sample=sample, cond=cond, return_dict=False)[0]
+    def decode(self, sample, z1, z2):
+        return self.decoder(sample=sample, z1=z1, z2=z2, return_dict=False)[0]
 
 
 # ============================================================
@@ -115,6 +114,6 @@ class Autoencoder(BaseAutoencoder):
 @register_model("autoencoder_v2")
 class AutoencoderV2(BaseAutoencoder):
     def forward(self, x1, x2):
-        z_diff = self.encode(x2 - x1)
-        recon = self.decode(x1, z_diff)
-        return recon, z_diff
+        z1, z2 = self.encode(x2 - x1)
+        recon = self.decode(x1, z1, z2)
+        return recon, (z1, z2)

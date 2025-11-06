@@ -9,14 +9,14 @@ warmup_epoch: 5
 # Data configuration
 data:
   root: "/data/pturaga/datasets/Penn_Action/"  # Path to Penn Action frames directory
-  train_pairs_json: "/home/rgoel15/motion_imitation/data/train_set.json"  # JSON file with frame pairs for training
-  val_pairs_json: "/home/rgoel15/motion_imitation/data/val_set.json"      # JSON file with frame pairs for validation
+  train_pairs_json: "./data/train_set.json"  # JSON file with frame pairs for training
+  val_pairs_json: "./data/val_set.json"      # JSON file with frame pairs for validation
   frame_size: 256                       # Size to resize frames to
   num_workers: 32                        # Number of data loading workers
 
 # Model parameters
 model:
-  type: "masked_inputs"  # Options: "autoencoder", "dino"
+  type: "autoencoder_v2"  # Options: "autoencoder", "dino"
   image_size: 256
   patch_size: 16
   latent_dim: 64
@@ -37,8 +37,8 @@ accelerate:
 
 # Logging parameters
 logging:
-  model_save_path: '/scratch/rgoel15/motion_emitation_data/model_image_difference/auto_unet.pt'
-  tensorboard_log_dir: '/scratch/rgoel15/motion_emitation_data/tensorboard_logs'
+  model_save_path: '/scratch/unath/motion_emitation_data/model_image_difference/auto_unet.pt'
+  tensorboard_log_dir: '/scratch/unath/motion_emitation_data/tensorboard_logs'
 
 # WandB configuration
 wandb:
@@ -46,7 +46,7 @@ wandb:
   project: 'motion_emitation'
   run_name: 'image_difference'
   mode: 'online'  # Options: 'online', 'offline', 'disabled'
-  dir: '/scratch/rgoel15/motion_emitation_data/wandb_logs'
+  dir: '/scratch/unath/motion_emitation_data/wandb_logs'
 
 # Validation parameters
 validation:
